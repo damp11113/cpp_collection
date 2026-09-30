@@ -22,6 +22,13 @@
 //   --dev <hz>         FM peak deviation (default 5000)
 //   --am-index <m>     AM modulation index (default 0.8)
 //   --pcm16            write I/Q WAV as 16-bit PCM instead of float32
+//   --noise-floor <db> add white noise across the whole I/Q band at this total
+//                      power in dBFS (0 dBFS = full-scale carrier, |I + jQ| = 1)
+//   --cnr <db>         add white noise so the carrier-to-noise ratio inside the
+//                      channel bandwidth (or the whole band) is this value
+//   --seed <n>         noise seed for repeatable output (default: random)
+//                      Noise is added after modulation (mod) or before the channel
+//                      filter (demod), so both can simulate a noisy receiver.
 //
 // Example (narrowband FM, 3 kHz audio, 16 kHz channel, 192 kHz I/Q WAV):
 //   iq_modem mod fm voice.wav nbfm_iq.wav --audio-bw 3000 --channel-bw 16000 --iq-rate 192000
@@ -38,6 +45,8 @@
 #include <cctype>
 #include <string>
 #include <random>
+#include <sstream>
+#include <iomanip>
 #include <algorithm>
 
 using namespace std;
@@ -108,6 +117,91 @@ vector<float> fmDemodulate(const vector<iq_t>& iq, double sampleRate, double dev
 }
 
 // ---------------------------------------------------------------------------
+// FFT and fast convolution
+// ---------------------------------------------------------------------------
+
+typedef complex<double> cd;
+
+// In-place iterative radix-2 FFT; size must be a power of two.
+void fft(vector<cd>& a, bool inverse) {
+    const size_t n = a.size();
+    for (size_t i = 1, j = 0; i < n; ++i) {
+        size_t bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) swap(a[i], a[j]);
+    }
+    for (size_t len = 2; len <= n; len <<= 1) {
+        double ang = 2.0 * PI / len * (inverse ? 1 : -1);
+        cd wlen(cos(ang), sin(ang));
+        for (size_t i = 0; i < n; i += len) {
+            cd w(1.0, 0.0);
+            for (size_t k = 0; k < len / 2; ++k) {
+                cd u = a[i + k];
+                cd v = a[i + k + len / 2] * w;
+                a[i + k] = u + v;
+                a[i + k + len / 2] = u - v;
+                w *= wlen;
+            }
+        }
+    }
+    if (inverse) for (auto& x : a) x /= (double)n;
+}
+
+inline cd toCd(float x) { return cd(x, 0.0); }
+inline cd toCd(const iq_t& x) { return cd(x.real(), x.imag()); }
+inline void addTo(float& y, const cd& v) { y += (float)v.real(); }
+inline void addTo(iq_t& y, const cd& v) { y += iq_t((float)v.real(), (float)v.imag()); }
+
+// Centered (zero-delay) FIR convolution. Works for real or complex data/taps
+// (the output has the input's type). Long filters use FFT overlap-add, which
+// costs O(log taps) per sample instead of O(taps).
+template <typename T, typename C>
+vector<T> firFilter(const vector<T>& in, const vector<C>& h) {
+    const long n = (long)in.size();
+    const long taps = (long)h.size();
+    const long r = (taps - 1) / 2;
+    vector<T> out(n);
+
+    if (taps <= 64) {
+        for (long i = 0; i < n; ++i) {
+            cd acc = 0.0;
+            for (long k = max(-r, i - (n - 1)); k <= min(r, i); ++k) {
+                acc += toCd(in[i - k]) * toCd(h[k + r]);
+            }
+            addTo(out[i], acc);
+        }
+        return out;
+    }
+
+    size_t fftSize = 1;
+    while (fftSize < 4 * (size_t)taps) fftSize <<= 1;
+    const long block = (long)fftSize - taps + 1; // new input samples per FFT
+
+    vector<cd> H(fftSize);
+    for (long k = 0; k < taps; ++k) H[k] = toCd(h[k]);
+    fft(H, false);
+
+    vector<cd> buf(fftSize);
+    for (long start = 0; start < n; start += block) {
+        long len = min(block, n - start);
+        fill(buf.begin(), buf.end(), cd());
+        for (long i = 0; i < len; ++i) buf[i] = toCd(in[start + i]);
+
+        fft(buf, false);
+        for (size_t i = 0; i < fftSize; ++i) buf[i] *= H[i];
+        fft(buf, true);
+
+        // buf[j] is the causal output at start + j; the centered output is r samples earlier
+        for (long j = 0; j < len + taps - 1; ++j) {
+            long o = start + j - r;
+            if (o >= 0 && o < n) addTo(out[o], buf[j]);
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // SSB
 // ---------------------------------------------------------------------------
 
@@ -128,20 +222,7 @@ vector<float> hilbert(const vector<float>& in) {
             h[k + HILBERT_RADIUS] = (float)(w * 2.0 / (PI * k));
         }
     }
-
-    const long n = (long)in.size();
-    vector<float> out(n, 0.0f);
-    for (long i = 0; i < n; ++i) {
-        double acc = 0.0;
-        for (int k = -HILBERT_RADIUS; k <= HILBERT_RADIUS; k += 2) { // even taps are zero
-            if (k == 0) continue;
-            long j = i - k;
-            if (j < 0 || j >= n) continue;
-            acc += h[k + HILBERT_RADIUS] * in[j];
-        }
-        out[i] = (float)acc;
-    }
-    return out;
+    return firFilter(in, h);
 }
 
 // SSB via the phasing method: the analytic signal x + j*H{x} only has positive
@@ -264,24 +345,6 @@ vector<float> designLowpass(double cutoff, double fs) {
     return h;
 }
 
-// Centered (zero-delay) FIR convolution. Works for real or complex data/taps.
-template <typename T, typename C>
-vector<T> firFilter(const vector<T>& in, const vector<C>& h) {
-    const long n = (long)in.size();
-    const long r = (long)(h.size() - 1) / 2;
-    vector<T> out(n);
-    for (long i = 0; i < n; ++i) {
-        T acc = T();
-        long kLo = max(-r, i - (n - 1));
-        long kHi = min(r, i);
-        for (long k = kLo; k <= kHi; ++k) {
-            acc += in[i - k] * h[k + r];
-        }
-        out[i] = acc;
-    }
-    return out;
-}
-
 // Arbitrary-ratio resampler (windowed-sinc interpolation). Band-limits to the
 // lower of the two Nyquist rates so downsampling doesn't alias.
 template <typename T>
@@ -293,14 +356,25 @@ vector<T> resample(const vector<T>& in, double fsIn, double fsOut) {
     const int half = (int)ceil(16.0 / (2.0 * fc));              // 16 zero crossings each side
     const long n = (long)in.size();
 
+    // Kernel is symmetric, so tabulate it over |d| at 512 points per input sample
+    // and interpolate linearly instead of calling sin/cos for every tap.
+    const int P = 512;
+    vector<float> table((size_t)half * P + 2);
+    for (size_t i = 0; i < table.size(); ++i) {
+        double d = (double)i / P;
+        table[i] = d >= half ? 0.0f : (float)(2.0 * fc * sinc(2.0 * fc * d) * blackman(d / half));
+    }
+
     vector<T> out((size_t)floor(n / ratio));
     for (size_t m = 0; m < out.size(); ++m) {
         double t = m * ratio;
         long c = (long)floor(t);
         T acc = T();
         for (long k = max(0L, c - half + 1); k <= min(n - 1, c + half); ++k) {
-            double d = t - k;
-            acc += in[k] * (float)(2.0 * fc * sinc(2.0 * fc * d) * blackman(d / half));
+            double x = fabs(t - k) * P;
+            size_t i0 = (size_t)x;
+            float frac = (float)(x - i0);
+            acc += in[k] * (table[i0] + frac * (table[i0 + 1] - table[i0]));
         }
         out[m] = acc;
     }
@@ -334,6 +408,9 @@ struct ModemOptions {
     double iqRate = 0.0;       // mod: I/Q output rate (0 = same as audio). demod: rate of a raw .iq input
     double audioRate = 0.0;    // demod: audio output rate (0 = min(I/Q rate, 48000))
     bool pcm16 = false;        // write I/Q WAV as 16-bit PCM instead of float32
+    double noiseFloor = NAN;   // total noise power over the I/Q band, dBFS (NAN = off)
+    double cnr = NAN;          // carrier-to-noise ratio in the channel, dB (NAN = off)
+    unsigned seed = 0;         // noise seed (0 = random)
 };
 
 bool isValidMode(const string& mode) {
@@ -354,6 +431,43 @@ void checkSettings(const ModemOptions& o, double iqRate) {
                  << iqRate << " Hz, the signal will alias. Raise --iq-rate or lower --dev/--audio-bw" << endl;
         }
     }
+}
+
+// Fixed-point formatting for printouts (avoids "1e+06" and "-8.6e-08")
+string fmt(double v, int decimals = 1) {
+    ostringstream os;
+    os << fixed << setprecision(decimals) << (fabs(v) < 0.5 * pow(10.0, -decimals) ? 0.0 : v);
+    return os.str();
+}
+
+double meanPower(const vector<iq_t>& iq) {
+    double p = 0.0;
+    for (const auto& s : iq) p += norm(s);
+    return iq.empty() ? 0.0 : p / iq.size();
+}
+
+double toDb(double power) {
+    return 10.0 * log10(max(power, 1e-30));
+}
+
+// Adds a white noise floor across the whole I/Q band, set either as an absolute
+// level (--noise-floor) or as a carrier-to-noise ratio inside the channel (--cnr).
+void applyNoise(vector<iq_t>& iq, double iqRate, const ModemOptions& o) {
+    bool useFloor = !isnan(o.noiseFloor);
+    if (!useFloor && isnan(o.cnr)) return;
+
+    double sigPow = meanPower(iq);
+    double bw = o.channelBw > 0 && o.channelBw < iqRate ? o.channelBw : iqRate;
+    double inBand = bw / iqRate; // share of the white noise that falls inside the channel
+    double noisePow = useFloor ? pow(10.0, o.noiseFloor / 10.0)
+                               : sigPow / pow(10.0, o.cnr / 10.0) / inBand;
+
+    unsigned seed = o.seed ? o.seed : random_device{}();
+    addNoise(iq, (float)sqrt(noisePow / 2.0), seed);
+
+    cout << "Noise floor: " << fmt(toDb(noisePow)) << " dBFS total (" << fmt(toDb(noisePow / iqRate))
+         << " dBFS/Hz), signal " << fmt(toDb(sigPow)) << " dBFS, CNR in " << fmt(bw, 0) << " Hz: "
+         << fmt(toDb(sigPow / (noisePow * inBand))) << " dB, seed " << seed << endl;
 }
 
 vector<iq_t> modulatePipeline(vector<float> audio, double audioRate, const ModemOptions& o, double& iqRate) {
@@ -698,6 +812,34 @@ int runTest() {
                measureSnrDb(tone, filtered, skip), 20.0);
     }
 
+    // Noise floor calibration: level in dBFS and CNR inside the channel
+    cout << "Noise floor:" << endl;
+    auto checkNear = [&](const string& name, double value, double expected, double tol) {
+        bool pass = fabs(value - expected) <= tol;
+        ok = ok && pass;
+        cout << "  " << name << ": " << value << " dB (expected " << expected << ")"
+             << (pass ? "" : "  <-- FAIL") << endl;
+    };
+
+    ModemOptions no;
+    no.mode = "fm";
+    no.noiseFloor = -30.0;
+    no.seed = 42;
+    vector<iq_t> silence(200000);
+    applyNoise(silence, iqRate, no);
+    checkNear("Measured noise floor", toDb(meanPower(silence)), -30.0, 0.1);
+
+    no.noiseFloor = NAN;
+    no.cnr = 15.0;
+    no.channelBw = 18000;
+    vector<iq_t> clean = fmModulate(tone, iqRate, 5000);
+    vector<iq_t> noisy = clean;
+    applyNoise(noisy, iqRate, no);
+    vector<iq_t> noiseOnly(noisy.size());
+    for (size_t i = 0; i < noisy.size(); ++i) noiseOnly[i] = noisy[i] - clean[i];
+    noiseOnly = channelFilter(noiseOnly, "fm", no.channelBw, iqRate);
+    checkNear("Measured CNR in 18 kHz", toDb(meanPower(clean) / meanPower(noiseOnly)), 15.0, 0.5);
+
     cout << (ok ? "PASS" : "FAIL") << endl;
     return ok ? 0 : 1;
 }
@@ -713,12 +855,13 @@ int runMod(const string& inPath, const string& outPath, const ModemOptions& o) {
     checkSettings(o, o.iqRate > 0 ? o.iqRate : fs);
     double iqRate;
     vector<iq_t> iq = modulatePipeline(audio, fs, o, iqRate);
+    applyNoise(iq, iqRate, o);
 
     if (!saveIq(outPath, iq, iqRate, o.pcm16)) {
         cerr << "Failed to write " << outPath << endl;
         return 1;
     }
-    cout << "Wrote " << iq.size() << " I/Q samples @ " << iqRate << " Hz to " << outPath
+    cout << "Wrote " << iq.size() << " I/Q samples @ " << fmt(iqRate, 0) << " Hz to " << outPath
          << (hasWavExtension(outPath) ? (o.pcm16 ? " (stereo 16-bit WAV)" : " (stereo float32 WAV)") : " (raw cf32)")
          << endl;
     return 0;
@@ -733,6 +876,7 @@ int runDemod(const string& inPath, const string& outPath, const ModemOptions& o)
     }
 
     checkSettings(o, iqRate);
+    applyNoise(iq, iqRate, o);
     double audioRate;
     vector<float> audio = demodulatePipeline(iq, iqRate, o, audioRate);
     normalize(audio);
@@ -741,7 +885,7 @@ int runDemod(const string& inPath, const string& outPath, const ModemOptions& o)
         cerr << "Failed to write " << outPath << endl;
         return 1;
     }
-    cout << "Wrote " << audio.size() << " audio samples @ " << audioRate << " Hz to " << outPath << endl;
+    cout << "Wrote " << audio.size() << " audio samples @ " << fmt(audioRate, 0) << " Hz to " << outPath << endl;
     return 0;
 }
 
@@ -760,6 +904,9 @@ void usage(const char* prog) {
          << "  --dev <hz>         FM peak deviation (default 5000)" << endl
          << "  --am-index <m>     AM modulation index (default 0.8)" << endl
          << "  --pcm16            write I/Q WAV as 16-bit PCM instead of float32" << endl
+         << "  --noise-floor <db> add white noise at this total power in dBFS over the I/Q band" << endl
+         << "  --cnr <db>         add white noise for this carrier-to-noise ratio in the channel" << endl
+         << "  --seed <n>         noise seed for repeatable output (default: random)" << endl
          << endl
          << "I/Q WAV files are stereo with I = left, Q = right." << endl;
 }
@@ -786,6 +933,9 @@ bool parseOptions(int argc, char* argv[], int start, bool isMod, ModemOptions& o
             else if (a == "--audio-rate") o.audioRate = v;
             else if (a == "--dev") o.deviation = v;
             else if (a == "--am-index") o.amIndex = v;
+            else if (a == "--noise-floor") o.noiseFloor = v;
+            else if (a == "--cnr") o.cnr = v;
+            else if (a == "--seed") o.seed = (unsigned)v;
             else {
                 cerr << "Unknown option " << a << endl;
                 return false;
@@ -828,6 +978,10 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         if (!parseOptions(argc, argv, 5, cmd == "mod", o)) return 1;
+        if (!isnan(o.noiseFloor) && !isnan(o.cnr)) {
+            cerr << "Use either --noise-floor or --cnr, not both" << endl;
+            return 1;
+        }
         return cmd == "mod" ? runMod(argv[3], argv[4], o) : runDemod(argv[3], argv[4], o);
     }
 
