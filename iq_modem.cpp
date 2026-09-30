@@ -1,16 +1,16 @@
-// Simple I/Q AM/FM modulator and demodulator (complex baseband)
+// Simple I/Q AM/FM/SSB modulator and demodulator (complex baseband)
 //
 // Build: g++ -O2 -std=c++17 iq_modem.cpp -o iq_modem
 //
 // Usage:
 //   iq_modem test
 //       Run a self-test: tone -> modulate -> noise -> demodulate, prints SNR.
-//   iq_modem mod   <am|fm> <in.wav> <out.iq> [param]
+//   iq_modem mod   <am|fm|usb|lsb> <in.wav> <out.iq> [param]
 //       Modulate a 16-bit PCM WAV into interleaved float32 I/Q (cf32, GNU Radio / SDR# compatible).
 //       param = AM modulation index (default 0.8) or FM deviation in Hz (default 5000).
-//   iq_modem demod <am|fm> <in.iq> <out.wav> <sample_rate> [param]
+//   iq_modem demod <am|fm|usb|lsb> <in.iq> <out.wav> <sample_rate> [param]
 //       Demodulate interleaved float32 I/Q into a 16-bit PCM mono WAV.
-//       param = FM deviation in Hz (default 5000), ignored for AM.
+//       param = FM deviation in Hz (default 5000), ignored for AM/SSB.
 
 #include <iostream>
 #include <fstream>
@@ -46,7 +46,8 @@ vector<iq_t> amModulate(const vector<float>& audio, float modIndex) {
 // Using the magnitude makes it immune to carrier phase offset.
 vector<float> amDemodulate(const vector<iq_t>& iq) {
     vector<float> audio(iq.size());
-    float prevIn = 0.0f, prevOut = 0.0f;
+    // Start the blocker at the first envelope value so the carrier isn't seen as a step
+    float prevIn = iq.empty() ? 0.0f : abs(iq[0]), prevOut = 0.0f;
     const float R = 0.999f; // DC blocker pole
     for (size_t i = 0; i < iq.size(); ++i) {
         float env = abs(iq[i]);
@@ -85,6 +86,73 @@ vector<float> fmDemodulate(const vector<iq_t>& iq, double sampleRate, double dev
         iq_t d = iq[i] * conj(prev);
         audio[i] = (float)(gain * atan2(d.imag(), d.real()));
         prev = iq[i];
+    }
+    return audio;
+}
+
+// ---------------------------------------------------------------------------
+// SSB
+// ---------------------------------------------------------------------------
+
+const int HILBERT_RADIUS = 127; // 255-tap FIR
+
+// Windowed FIR Hilbert transformer (90 degree phase shift).
+// Ideal response is h[n] = 2/(pi*n) for odd n, 0 for even n; a Blackman window
+// tames the ripple. Applied centered (non-causal), so output lines up with input.
+vector<float> hilbert(const vector<float>& in) {
+    static vector<float> h;
+    if (h.empty()) {
+        h.resize(2 * HILBERT_RADIUS + 1, 0.0f);
+        const int N = 2 * HILBERT_RADIUS;
+        for (int k = -HILBERT_RADIUS; k <= HILBERT_RADIUS; ++k) {
+            if (k % 2 == 0) continue;
+            double m = k + HILBERT_RADIUS;
+            double w = 0.42 - 0.5 * cos(2.0 * PI * m / N) + 0.08 * cos(4.0 * PI * m / N);
+            h[k + HILBERT_RADIUS] = (float)(w * 2.0 / (PI * k));
+        }
+    }
+
+    const long n = (long)in.size();
+    vector<float> out(n, 0.0f);
+    for (long i = 0; i < n; ++i) {
+        double acc = 0.0;
+        for (int k = -HILBERT_RADIUS; k <= HILBERT_RADIUS; k += 2) { // even taps are zero
+            if (k == 0) continue;
+            long j = i - k;
+            if (j < 0 || j >= n) continue;
+            acc += h[k + HILBERT_RADIUS] * in[j];
+        }
+        out[i] = (float)acc;
+    }
+    return out;
+}
+
+// SSB via the phasing method: the analytic signal x + j*H{x} only has positive
+// frequencies (USB); x - j*H{x} only has negative frequencies (LSB).
+vector<iq_t> ssbModulate(const vector<float>& audio, bool upper) {
+    vector<float> q = hilbert(audio);
+    vector<iq_t> iq(audio.size());
+    for (size_t i = 0; i < audio.size(); ++i) {
+        iq[i] = iq_t(audio[i], upper ? q[i] : -q[i]);
+    }
+    return iq;
+}
+
+// SSB demod: I - H{Q} keeps positive frequencies (USB), I + H{Q} keeps negative
+// ones (LSB). The opposite sideband cancels, so it is rejected.
+// Unlike the AM envelope detector this needs the carrier phase to be correct;
+// a phase error only phase-shifts the audio, which the ear barely notices.
+vector<float> ssbDemodulate(const vector<iq_t>& iq, bool upper) {
+    vector<float> i(iq.size()), q(iq.size());
+    for (size_t n = 0; n < iq.size(); ++n) {
+        i[n] = iq[n].real();
+        q[n] = iq[n].imag();
+    }
+    vector<float> hq = hilbert(q);
+
+    vector<float> audio(iq.size());
+    for (size_t n = 0; n < iq.size(); ++n) {
+        audio[n] = 0.5f * (upper ? i[n] - hq[n] : i[n] + hq[n]);
     }
     return audio;
 }
@@ -302,6 +370,26 @@ int runTest() {
     vector<float> fmOut = movingAverage(fmDemodulate(fm, fs, dev), 4);
     double fmSnr = measureSnrDb(tone, fmOut, skip);
 
+    // SSB: no phase rotation here, the product detector needs a locked carrier
+    vector<iq_t> usb = ssbModulate(tone, true);
+    addNoise(usb, noise);
+    vector<float> usbOut = ssbDemodulate(usb, true);
+    double usbSnr = measureSnrDb(tone, usbOut, skip);
+
+    vector<iq_t> lsb = ssbModulate(tone, false);
+    addNoise(lsb, noise);
+    vector<float> lsbOut = ssbDemodulate(lsb, false);
+    double lsbSnr = measureSnrDb(tone, lsbOut, skip);
+
+    // Opposite sideband rejection: demodulate the USB signal as LSB
+    vector<float> wrongOut = ssbDemodulate(ssbModulate(tone, true), false);
+    double rightPow = 0, wrongPow = 0;
+    for (size_t i = skip; i < n - skip; ++i) {
+        rightPow += (double)tone[i] * tone[i];
+        wrongPow += (double)wrongOut[i] * wrongOut[i];
+    }
+    double rejectDb = 10.0 * log10(rightPow / max(wrongPow, 1e-20));
+
     cout << "Self-test: 1 kHz tone, fs = " << fs << " Hz, noise sigma = " << noise << endl;
     cout << "  First I/Q samples (AM): ";
     for (int i = 0; i < 3; ++i) cout << am[i] << " ";
@@ -310,8 +398,11 @@ int runTest() {
     cout << endl;
     cout << "  AM demod SNR: " << amSnr << " dB" << endl;
     cout << "  FM demod SNR: " << fmSnr << " dB" << endl;
+    cout << "  USB demod SNR: " << usbSnr << " dB" << endl;
+    cout << "  LSB demod SNR: " << lsbSnr << " dB" << endl;
+    cout << "  Opposite sideband rejection: " << rejectDb << " dB" << endl;
 
-    bool ok = amSnr > 20.0 && fmSnr > 20.0;
+    bool ok = amSnr > 20.0 && fmSnr > 20.0 && usbSnr > 20.0 && lsbSnr > 20.0 && rejectDb > 30.0;
     cout << (ok ? "PASS" : "FAIL") << endl;
     return ok ? 0 : 1;
 }
@@ -329,6 +420,8 @@ int runMod(const string& mode, const string& inPath, const string& outPath, doub
         iq = amModulate(audio, (float)(param > 0 ? param : 0.8));
     } else if (mode == "fm") {
         iq = fmModulate(audio, fs, param > 0 ? param : 5000.0);
+    } else if (mode == "usb" || mode == "lsb") {
+        iq = ssbModulate(audio, mode == "usb");
     } else {
         cerr << "Unknown mode: " << mode << endl;
         return 1;
@@ -354,6 +447,8 @@ int runDemod(const string& mode, const string& inPath, const string& outPath, in
         audio = amDemodulate(iq);
     } else if (mode == "fm") {
         audio = fmDemodulate(iq, fs, param > 0 ? param : 5000.0);
+    } else if (mode == "usb" || mode == "lsb") {
+        audio = ssbDemodulate(iq, mode == "usb");
     } else {
         cerr << "Unknown mode: " << mode << endl;
         return 1;
@@ -373,8 +468,8 @@ int runDemod(const string& mode, const string& inPath, const string& outPath, in
 void usage(const char* prog) {
     cout << "Usage:" << endl
          << "  " << prog << " test" << endl
-         << "  " << prog << " mod   <am|fm> <in.wav> <out.iq> [am_index|fm_deviation_hz]" << endl
-         << "  " << prog << " demod <am|fm> <in.iq> <out.wav> <sample_rate> [fm_deviation_hz]" << endl;
+         << "  " << prog << " mod   <am|fm|usb|lsb> <in.wav> <out.iq> [am_index|fm_deviation_hz]" << endl
+         << "  " << prog << " demod <am|fm|usb|lsb> <in.iq> <out.wav> <sample_rate> [fm_deviation_hz]" << endl;
 }
 
 int main(int argc, char* argv[]) {
