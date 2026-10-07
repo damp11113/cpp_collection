@@ -185,6 +185,24 @@ static void test_block_roundtrip() {
     }
 }
 
+static void test_quant_div() {
+    std::printf("reciprocal quantization\n");
+    bool ok = true;
+    for (uint32_t q = 1; q <= 255 && ok; ++q) {
+        uint32_t d = q * 8;
+        uint64_t r = detail::quant_recip(d);
+        for (int32_t v = -(1 << 16); v <= (1 << 16); ++v) {
+            int32_t expect = v < 0 ? -((-v + int32_t(d) / 2) / int32_t(d)) : (v + int32_t(d) / 2) / int32_t(d);
+            if (detail::quant_div(v, d, r) != expect) {
+                std::printf("  mismatch v=%d d=%u\n", v, d);
+                ok = false;
+                break;
+            }
+        }
+    }
+    CHECK(ok);
+}
+
 static void test_bitmap() {
     std::printf("bitmap packing\n");
     for (int n : {1, 7, 8, 9, 300, 1021}) {
@@ -297,8 +315,10 @@ static void test_header() {
     CHECK(parse_stream_header(buf, &r) == Status::Ok);
     CHECK(r.width == h.width && r.height == h.height && r.tile_w == 32 && r.tile_h == 48 &&
           r.refresh_mode == h.refresh_mode && r.refresh_param == 600 && r.quality == 42);
-    buf[8] = 24;  // not a multiple of 16
+    buf[8] = 0;  // tile width 0
     CHECK(parse_stream_header(buf, &r) == Status::BadHeader);
+    buf[8] = 1;
+    CHECK(parse_stream_header(buf, &r) == Status::Ok);
     CHECK(validate_geometry(64, 64, 128, 128) != nullptr);  // payload could overflow tile_len
     CHECK(validate_geometry(64, 64, 112, 112) == nullptr);
 }
@@ -400,6 +420,36 @@ static void test_pipeline() {
     run_pipeline(321, 179, 48, 16, RefreshMode::None, 0, 50, DiffReference::LastCoded);  // odd size, padding
     run_pipeline(100, 60, 64, 64, RefreshMode::Rolling, 1, 100, DiffReference::LastCoded);
     run_pipeline(64, 64, 16, 16, RefreshMode::Rolling, 5, 5, DiffReference::LastCoded);
+    // Tiles that are not multiples of 16: partial blocks and shared chroma ownership.
+    run_pipeline(320, 240, 8, 8, RefreshMode::Rolling, 30, 75, DiffReference::LastCoded);
+    run_pipeline(97, 61, 1, 1, RefreshMode::Rolling, 200, 75, DiffReference::LastCoded);
+    run_pipeline(97, 61, 3, 5, RefreshMode::FullPeriodic, 7, 75, DiffReference::Reconstructed);
+    run_pipeline(131, 77, 13, 9, RefreshMode::None, 0, 90, DiffReference::LastCoded);
+    run_pipeline(64, 48, 2, 1, RefreshMode::Rolling, 50, 60, DiffReference::LastCoded);
+}
+
+static void test_threads_deterministic() {
+    std::printf("thread count does not change the stream\n");
+    for (int tile : {1, 7, 16, 64}) {
+        std::vector<uint8_t> ref;
+        for (int threads : {1, 2, 3, 8}) {
+            Config cfg;
+            cfg.width = 200;
+            cfg.height = 120;
+            cfg.tile_w = cfg.tile_h = uint8_t(tile);
+            cfg.threads = threads;
+            Encoder enc;
+            CHECK(enc.init(cfg));
+            std::vector<uint8_t> stream, f;
+            enc.write_stream_header(stream);
+            for (int t = 0; t < 6; ++t) {
+                make_frame(f, 200, 120, t);
+                enc.encode_frame(f.data(), stream);
+            }
+            if (ref.empty()) ref = stream;
+            CHECK(stream == ref);
+        }
+    }
 }
 
 static void test_corrupt_input() {
@@ -453,7 +503,9 @@ int main() {
     test_sad();
     test_refresh_policy();
     test_header();
+    test_quant_div();
     test_pipeline();
+    test_threads_deterministic();
     test_corrupt_input();
     std::printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;

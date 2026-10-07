@@ -14,8 +14,8 @@ The decoder keeps a persistent framebuffer and patches it.
 ## Build
 
 ```bash
-g++ -std=c++17 -O2 -o tjc tjc.cpp
-g++ -std=c++17 -O2 -o tjc_test tjc_test.cpp && ./tjc_test
+g++ -std=c++17 -O2 -pthread -o tjc tjc.cpp
+g++ -std=c++17 -O2 -pthread -o tjc_test tjc_test.cpp && ./tjc_test
 ```
 
 or `cmake -B build && cmake --build build && ./build/tjc_test`.
@@ -91,13 +91,44 @@ Add `-v` for a per-frame log on stderr and `--psnr` (encoder) for quality number
 | Option                   | Default      | Meaning |
 |--------------------------|--------------|---------|
 | `--width` / `--height` / `--size WxH` | required | frame size |
-| `--tile-size WxH` or `N` | `16x16`      | multiples of 16, up to 240; `w*h` at most 12544 (e.g. 64x64, 128x64, 112x112) |
+| `--tile-size WxH` or `N` | `16x16`      | 1..255 each; `w*h` at most 12544 (e.g. 64x64, 128x64, 112x112). See "Choosing a tile size" |
 | `--motion-threshold K`   | `3`          | tile is dirty when any 8x8 block's mean abs diff per sample is > K; `0` = any change |
 | `--refresh-mode`         | `rolling`    | `none`, `full` (full refresh every N frames), `rolling` (N tiles per frame, round robin) |
 | `--refresh-param N`      | `30`         | N for the refresh mode |
 | `--quality Q`            | `75`         | 1..100, libjpeg-style scaling of the standard quant tables |
 | `--diff-ref`             | `last-coded` | what the new frame is compared to: `last-coded` source pixels or `recon` (decoded pixels) |
 | `--keyframe-every N`     | `0`          | additionally force a full refresh every N frames |
+| `--threads N`            | `0`          | encoder threads, `0` = all cores. The output is identical for any value |
+
+### Choosing a tile size
+
+Smaller tiles skip more unchanged area but cost more per tile: 2 bytes of `tile_len`,
+one bitmap bit, and at least one 8x8 block per component even when the tile covers
+only a few pixels. Below 8x8 the overhead outweighs the savings fast. Here are the
+numbers for 1920x1080 `testsrc2`, q75, K=5, 4 threads:
+
+| Tile  | Bytes/frame | Dirty | vs raw | Encode speed |
+|-------|-------------|-------|--------|--------------|
+| 32x32 | 50.6 KB     | 17.0% | 61:1   | 118 fps |
+| 16x16 | 50.7 KB     | 11.9% | 61:1   | 140 fps |
+| 8x8   | 79.8 KB     |  9.3% | 39:1   | 111 fps |
+| 4x4   | 201 KB      |  7.9% | 15:1   | 52 fps  |
+| 2x2   | 468 KB      |  7.1% | 6.6:1  | 22 fps  |
+| 1x1   | 909 KB      |  6.4% | 3.4:1  | 13 fps  |
+
+A 1x1 tile turns each pixel into three 8x8 blocks plus a length field, which is
+more bytes than the raw pixel. A full refresh at 1x1 is bigger than the raw frame.
+Use 16x16 or 8x8 unless you have a specific reason not to.
+
+### Speed
+
+- Build optimized: `/O2` (MSVC) or `-O2`/`-O3` (gcc/clang). An unoptimized build
+  is about 3.5x slower.
+- The encoder uses every core by default (`--threads`). Tiles are split into
+  contiguous runs and joined in order, so the stream doesn't depend on the thread
+  count. The decoder stays single-threaded for the embedded target.
+- Worst case (every tile changes every frame) at 1080p: about 30 fps on 1 thread,
+  about 60 fps on 4 threads.
 
 With `--diff-ref recon` at low quality the quantization error alone can exceed a
 small K and keep static tiles dirty; `last-coded` doesn't have that problem and still
@@ -132,6 +163,7 @@ Compile-time switches (define before the implementation include):
 - `TJC_NO_ENCODER`: decoder only. About 18 KB of code on x86-64 at `-O2`.
 - `TJC_STREAM_BIG_ENDIAN 1`: big-endian multi-byte stream fields.
 - `TJC_MAX_PIXELS n`: largest `width*height` the decoder will accept.
+- `TJC_NO_THREADS`: single-threaded encoder with no `<thread>` dependency.
 
 The decode path is integer-only (IJG "islow" DCT) and deterministic: decoder output
 is bit-identical to the encoder's internal reconstruction on every platform, so the
@@ -164,7 +196,9 @@ Changes from the original plan:
 
 - The first reserved header byte carries `quality`, so the decoder can rebuild the
   same quant tables (the tables themselves stay baked in).
-- Tiles must be multiples of 16 so that 4:2:0 chroma tiles are whole 8x8 blocks.
+- Tiles can be any size from 1 to 255. Partial 8x8 blocks are padded by edge
+  replication, and each 4:2:0 chroma sample belongs to the tile holding its top-left
+  luma pixel, so tiles never overlap (see the comment at the top of `tjc.h`).
 - Frame sizes don't have to be tile multiples (or even): the codec pads internally
   by edge replication and crops on output.
 - The motion threshold applies per 8x8 block instead of averaging over the whole

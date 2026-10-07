@@ -43,7 +43,7 @@ void usage() {
         "  --width, -W N              frame width in pixels (required)\n"
         "  --height, -H N             frame height in pixels (required)\n"
         "  --size WxH                 shorthand for --width/--height\n"
-        "  --tile-size WxH | N        tile size, multiples of 16 (default 16x16)\n"
+        "  --tile-size WxH | N        tile size 1..255 (default 16x16; below 8x8 costs more bits, see README)\n"
         "  --motion-threshold K       dirty if mean |diff| per sample > K (default 3, 0 = any change)\n"
         "  --refresh-mode MODE        none | full | rolling (default rolling)\n"
         "  --refresh-param N          full: refresh every N frames, rolling: N tiles per frame (default 30)\n"
@@ -51,6 +51,7 @@ void usage() {
         "  --diff-ref REF             last-coded | recon: what new frames are compared to (default last-coded)\n"
         "  --keyframe-every N         also force a full refresh every N frames (default 0 = off)\n"
         "  --psnr                     report PSNR of the reconstruction vs the source\n"
+        "  --threads N                encoder threads, 0 = all cores (default 0)\n"
         "\n"
         "common options:\n"
         "  -i FILE                    input (default stdin, '-' = stdin)\n"
@@ -156,7 +157,7 @@ Options parse_args(int argc, char** argv) {
         } else if (a == "--tile-size") {
             long w, h;
             parse_pair(next(), "--tile-size", w, h);
-            if (w > 255 || h > 255) die("--tile-size must be at most 240x240");
+            if (w > 255 || h > 255) die("--tile-size must be at most 255x255");
             o.cfg.tile_w = uint8_t(w);
             o.cfg.tile_h = uint8_t(h);
         } else if (a == "--motion-threshold") {
@@ -178,6 +179,8 @@ Options parse_args(int argc, char** argv) {
             else die("unknown diff reference '%s' (last-coded | recon)", m.c_str());
         } else if (a == "--keyframe-every") {
             o.keyframe_every = uint32_t(parse_int(next(), "--keyframe-every", 0, 1L << 30));
+        } else if (a == "--threads") {
+            o.cfg.threads = int(parse_int(next(), "--threads", 0, 256));
         } else if (a == "--psnr") {
             o.psnr = true;
         } else {

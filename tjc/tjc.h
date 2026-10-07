@@ -14,6 +14,7 @@
 //     TJC_STREAM_BIG_ENDIAN 1  write/read multi-byte stream fields big-endian (default 0 = little)
 //     TJC_NO_ENCODER           leave out the encoder (decode-only embedded builds)
 //     TJC_MAX_PIXELS n         largest width*height the decoder accepts (default 1<<26)
+//     TJC_NO_THREADS           single-threaded encoder (no <thread> dependency)
 //
 // The decode path is integer-only and deterministic: the same stream gives
 // bit-identical output on every platform, and the encoder's internal
@@ -26,8 +27,8 @@
 //     magic         4  "TJC1"
 //     width         2  pixels (luma)
 //     height        2  pixels (luma)
-//     tile_w        1  multiple of 16, 16..240
-//     tile_h        1  multiple of 16, 16..240
+//     tile_w        1  1..255 (see "Tiles" below)
+//     tile_h        1  1..255
 //     chroma_format 1  0 = 4:2:0 (only value accepted in v1)
 //     refresh_mode  1  0 = NONE, 1 = FULL_PERIODIC, 2 = ROLLING (informational)
 //     refresh_param 2  N for FULL_PERIODIC, tiles per frame for ROLLING
@@ -48,8 +49,15 @@
 //   then all Cb blocks, then all Cr blocks. The DC predictor resets to 0 at the start
 //   of each component of each tile, so every tile decodes on its own.
 //
-// Frame dimensions need not be multiples of the tile size: the codec works on an
-// internal frame padded up to whole tiles (edge pixels replicated) and crops on output.
+// Tiles: the codec works on an internal frame padded up to whole tiles (edge pixels
+// replicated) and crops on output, so frame sizes need not be tile multiples.
+//   Luma: tile (tx, ty) covers x in [tx*tile_w, (tx+1)*tile_w), same for y.
+//   Chroma: a 4:2:0 sample belongs to the tile holding its top-left luma pixel, so
+//     the tile covers chroma x in [(x0+1)/2, (x1+1)/2) for luma range [x0, x1).
+//     With odd tile sizes this can be empty (e.g. odd columns of 1x1 tiles).
+//   A tile is covered by ceil(w/8) x ceil(h/8) blocks per component; the last
+//   row/column of blocks may be partial: the encoder pads it by replicating the
+//   tile's edge pixels and the decoder keeps only the covered part.
 // ---------------------------------------------------------------------------
 
 #ifndef TJC_H_INCLUDED
@@ -102,6 +110,10 @@ struct Config {
     uint8_t quality = 75;  // 1..100, libjpeg-style scaling of the standard tables
 
     DiffReference diff_reference = DiffReference::LastCoded;
+
+    // Encoder worker threads, 0 = one per hardware thread. The output does not
+    // depend on this value. Ignored with TJC_NO_THREADS.
+    int threads = 0;
 };
 
 struct StreamHeader {
@@ -153,7 +165,7 @@ struct Layout {
     int tile_w = 0, tile_h = 0;
     int cols = 0, rows = 0, tiles = 0;
     int pwidth = 0, pheight = 0;      // padded luma size (whole tiles)
-    int pcwidth = 0, pcheight = 0;    // padded chroma size
+    int pcwidth = 0, pcheight = 0;    // padded chroma size, ceil(pwidth/2) x ceil(pheight/2)
 };
 
 // Size in bytes of one tightly packed YUV420P frame.
@@ -187,6 +199,17 @@ void idct8x8_dc(int32_t dc, uint8_t* dst, int stride);
 
 // Quant tables for a quality (1..100), natural order.
 void build_quant_tables(int quality, uint16_t luma[64], uint16_t chroma[64]);
+
+// Rounded division v / d (round half away from zero) done as a multiply by a
+// precomputed reciprocal. Exact for |v| + d/2 < 2^20 and 1 <= d <= 4095, far beyond
+// the range a forward DCT of 8-bit samples produces.
+inline uint64_t quant_recip(uint32_t d) { return (uint64_t(1) << 40) / d + 1; }
+inline int32_t quant_div(int32_t v, uint32_t d, uint64_t recip) {
+    int32_t sign = v >> 31;  // 0 or -1; branch-free because most results are 0
+    uint32_t a = uint32_t((v ^ sign) - sign) + (d >> 1);
+    int32_t q = int32_t((a * recip) >> 40);
+    return (q ^ sign) - sign;
+}
 
 struct HuffEnc {
     uint16_t code[256];
@@ -359,13 +382,19 @@ private:
     bool tile_changed(int tile) const;
     void encode_tile(int tile, std::vector<uint8_t>& out);
     void copy_tile(const Planes& from, Planes& to, int tile);
+    template <class F> void parallel_for(int n, int min_per_thread, F fn);
 
     Config cfg_;
     Layout layout_;
     Planes cur_, last_coded_, recon_;
-    uint16_t q_[2][64] = {};  // natural order
+    uint16_t q_[2][64] = {};      // natural order
+    uint32_t qdiv_[2][64] = {};   // zigzag order: 8 * q, the forward DCT's scale included
+    uint64_t qrecip_[2][64] = {}; // zigzag order: detail::quant_recip(qdiv_)
     detail::RefreshPolicy policy_;
     std::vector<uint8_t> dirty_;
+    std::vector<int> dirty_list_;
+    std::vector<std::vector<uint8_t>> worker_out_;
+    int threads_ = 1;
     uint32_t frame_num_ = 0;
     uint32_t frame_index_ = 0;
     bool keyframe_request_ = false;
@@ -387,6 +416,9 @@ private:
 
 #include <algorithm>
 #include <cstring>
+#if !defined(TJC_NO_ENCODER) && !defined(TJC_NO_THREADS)
+#include <thread>
+#endif
 
 static_assert((-5 >> 1) == -3, "tjc needs arithmetic right shift of negative integers");
 
@@ -567,15 +599,16 @@ size_t frame_size(int width, int height) {
 }
 
 size_t worst_case_tile_bytes(int tile_w, int tile_h) {
-    // 4:2:0 -> 1.5 samples per pixel. Per block: DC <= 16+11 bits, 63 AC <= 16+10 bits.
-    size_t blocks = size_t(tile_w) * size_t(tile_h) * 3 / 128;
-    return (blocks * (27 + 63 * 26) + 7) / 8;
+    // Luma blocks plus the most chroma blocks any tile position can own.
+    // Per block: DC <= 16+11 bits, 63 AC <= 16+10 bits.
+    size_t luma = size_t((tile_w + 7) / 8) * size_t((tile_h + 7) / 8);
+    size_t chroma = size_t(((tile_w + 1) / 2 + 7) / 8) * size_t(((tile_h + 1) / 2 + 7) / 8);
+    return ((luma + 2 * chroma) * (27 + 63 * 26) + 7) / 8;
 }
 
 const char* validate_geometry(int width, int height, int tile_w, int tile_h) {
     if (width <= 0 || height <= 0 || width > 65535 || height > 65535) return "width/height must be 1..65535";
-    if (tile_w < 16 || tile_h < 16 || tile_w > 240 || tile_h > 240 || tile_w % 16 || tile_h % 16)
-        return "tile width/height must be a multiple of 16 in 16..240";
+    if (tile_w < 1 || tile_h < 1 || tile_w > 255 || tile_h > 255) return "tile width/height must be 1..255";
     if (worst_case_tile_bytes(tile_w, tile_h) > size_t(kMaxTilePayload))
         return "tile too large: worst-case payload would not fit the 16-bit tile_len (keep w*h <= 12544, e.g. 112x112 or 128x64)";
     return nullptr;
@@ -594,8 +627,8 @@ Layout make_layout(int width, int height, int tile_w, int tile_h) {
     l.tiles = l.cols * l.rows;
     l.pwidth = l.cols * tile_w;
     l.pheight = l.rows * tile_h;
-    l.pcwidth = l.pwidth / 2;
-    l.pcheight = l.pheight / 2;
+    l.pcwidth = (l.pwidth + 1) / 2;
+    l.pcheight = (l.pheight + 1) / 2;
     return l;
 }
 
@@ -653,13 +686,36 @@ inline void visible_size(const Layout& l, int c, int& w, int& h) {
     h = c ? l.cheight : l.height;
 }
 
-// Tile rectangle of component c within its padded plane.
+// Tile rectangle of component c within its padded plane. A chroma sample belongs
+// to the tile holding its top-left luma pixel; w or h is 0 when a tile owns none.
 inline void tile_rect(const Layout& l, int tile, int c, int& x, int& y, int& w, int& h) {
-    int tx = tile % l.cols, ty = tile / l.cols;
-    w = c ? l.tile_w / 2 : l.tile_w;
-    h = c ? l.tile_h / 2 : l.tile_h;
-    x = tx * w;
-    y = ty * h;
+    int x0 = (tile % l.cols) * l.tile_w, y0 = (tile / l.cols) * l.tile_h;
+    if (c == 0) {
+        x = x0;
+        y = y0;
+        w = l.tile_w;
+        h = l.tile_h;
+        return;
+    }
+    x = (x0 + 1) / 2;
+    y = (y0 + 1) / 2;
+    w = (x0 + l.tile_w + 1) / 2 - x;
+    h = (y0 + l.tile_h + 1) / 2 - y;
+}
+
+// Copies a bw x bh area (bw, bh <= 8) into an 8x8 block, replicating the last
+// column and row to fill it.
+inline void load_partial_block(const uint8_t* src, int stride, int bw, int bh, uint8_t blk[64]) {
+    for (int y = 0; y < 8; ++y) {
+        const uint8_t* s = src + size_t(y < bh ? y : bh - 1) * stride;
+        uint8_t* d = blk + y * 8;
+        std::memcpy(d, s, size_t(bw));
+        std::memset(d + bw, s[bw - 1], size_t(8 - bw));
+    }
+}
+
+inline void store_partial_block(const uint8_t blk[64], uint8_t* dst, int stride, int bw, int bh) {
+    for (int y = 0; y < bh; ++y) std::memcpy(dst + size_t(y) * stride, blk + y * 8, size_t(bw));
 }
 
 void copy_cropped(const Planes& src, const Layout& l, uint8_t* dst) {
@@ -1074,20 +1130,27 @@ Status Decoder::read_header(ReadFn fn, void* user) {
 bool Decoder::decode_tile(const uint8_t* data, size_t size, int tile) {
     detail::BitReader br(data, size);
     int32_t coef[64];
+    uint8_t blk[64];
     for (int c = 0; c < 3; ++c) {
         int x0, y0, w, h;
         tile_rect(layout_, tile, c, x0, y0, w, h);
         int stride = fb_.stride[c];
-        uint8_t* base = fb_.p[c].data() + size_t(y0) * stride + x0;
         int table = c ? 1 : 0;
         int pred = 0;
         for (int by = 0; by < h; by += 8) {
             for (int bx = 0; bx < w; bx += 8) {
                 int r = detail::decode_block(br, table, dq_[table], pred, coef);
                 if (r < 0) return false;
-                uint8_t* dst = base + size_t(by) * stride + bx;
-                if (r) detail::idct8x8(coef, dst, stride);
-                else detail::idct8x8_dc(coef[0], dst, stride);
+                uint8_t* dst = fb_.p[c].data() + size_t(y0 + by) * stride + x0 + bx;
+                int bw = std::min(8, w - bx), bh = std::min(8, h - by);
+                if (bw == 8 && bh == 8) {
+                    if (r) detail::idct8x8(coef, dst, stride);
+                    else detail::idct8x8_dc(coef[0], dst, stride);
+                } else {
+                    if (r) detail::idct8x8(coef, blk, 8);
+                    else detail::idct8x8_dc(coef[0], blk, 8);
+                    store_partial_block(blk, dst, stride, bw, bh);
+                }
             }
         }
     }
@@ -1174,7 +1237,21 @@ bool Encoder::init(const Config& cfg) {
         return false;
     }
     dirty_.assign(size_t(layout_.tiles), 0);
+    dirty_list_.clear();
     detail::build_quant_tables(cfg.quality, q_[0], q_[1]);
+    for (int t = 0; t < 2; ++t) {
+        for (int k = 0; k < 64; ++k) {
+            qdiv_[t][k] = uint32_t(q_[t][detail::kZigzag[k]]) * 8;
+            qrecip_[t][k] = detail::quant_recip(qdiv_[t][k]);
+        }
+    }
+#ifdef TJC_NO_THREADS
+    threads_ = 1;
+#else
+    threads_ = cfg.threads > 0 ? cfg.threads : int(std::thread::hardware_concurrency());
+    threads_ = std::max(1, std::min(threads_, 256));
+#endif
+    worker_out_.assign(size_t(threads_), std::vector<uint8_t>());
     policy_.reset(cfg.refresh_mode, cfg.refresh_param, layout_.tiles);
     frame_num_ = 0;
     frame_index_ = 0;
@@ -1182,6 +1259,26 @@ bool Encoder::init(const Config& cfg) {
     error_ = nullptr;
     ready_ = true;
     return true;
+}
+
+// Splits [0, n) into contiguous chunks, one per worker (fewer when there is too little
+// work), and runs fn(begin, end, worker) on each. Chunk i always goes to worker i.
+template <class F>
+void Encoder::parallel_for(int n, int min_per_thread, F fn) {
+    int workers = std::min(threads_, n / std::max(1, min_per_thread));
+    if (workers <= 1) {
+        if (n > 0) fn(0, n, 0);
+        return;
+    }
+#ifdef TJC_NO_THREADS
+    fn(0, n, 0);
+#else
+    std::thread pool[256];
+    for (int w = 1; w < workers; ++w)
+        pool[w] = std::thread(fn, int(int64_t(n) * w / workers), int(int64_t(n) * (w + 1) / workers), w);
+    fn(0, int(int64_t(n) / workers), 0);
+    for (int w = 1; w < workers; ++w) pool[w].join();
+#endif
 }
 
 StreamHeader Encoder::stream_header() const {
@@ -1224,15 +1321,17 @@ void Encoder::load(const uint8_t* y, int ys, const uint8_t* u, int us, const uin
 bool Encoder::tile_changed(int tile) const {
     // Judged per 8x8 block so a small moving object is not averaged away in a big tile.
     const Planes& ref = cfg_.diff_reference == DiffReference::Reconstructed ? recon_ : last_coded_;
-    uint64_t limit = uint64_t(cfg_.motion_threshold_k) * 64;
+    uint64_t k = cfg_.motion_threshold_k;
     for (int c = 0; c < 3; ++c) {
         int x, y, w, h;
         tile_rect(layout_, tile, c, x, y, w, h);
         int s = cur_.stride[c];
         for (int by = 0; by < h; by += 8) {
             for (int bx = 0; bx < w; bx += 8) {
+                int bw = std::min(8, w - bx), bh = std::min(8, h - by);
+                uint64_t limit = k * uint64_t(bw * bh);
                 size_t off = size_t(y + by) * s + x + bx;
-                if (detail::sad(cur_.p[c].data() + off, s, ref.p[c].data() + off, s, 8, 8, limit) > limit)
+                if (detail::sad(cur_.p[c].data() + off, s, ref.p[c].data() + off, s, bw, bh, limit) > limit)
                     return true;
             }
         }
@@ -1259,34 +1358,44 @@ void Encoder::encode_tile(int tile, std::vector<uint8_t>& out) {
     detail::BitWriter bw(out);
     int32_t dct[64], deq[64];
     int16_t zz[64];
+    uint8_t blk[64];
     for (int c = 0; c < 3; ++c) {
         int x0, y0, w, h;
         tile_rect(layout_, tile, c, x0, y0, w, h);
         int stride = cur_.stride[c];
-        size_t base = size_t(y0) * stride + x0;
         int table = c ? 1 : 0;
         const uint16_t* q = q_[table];
+        const uint32_t* qdiv = qdiv_[table];
+        const uint64_t* qrecip = qrecip_[table];
         int pred = 0;
         for (int by = 0; by < h; by += 8) {
             for (int bx = 0; bx < w; bx += 8) {
-                size_t off = base + size_t(by) * stride + bx;
-                detail::fdct8x8(cur_.p[c].data() + off, stride, dct);
-                bool has_ac = false;
+                size_t off = size_t(y0 + by) * stride + x0 + bx;
+                int bw_ = std::min(8, w - bx), bh_ = std::min(8, h - by);
+                bool full = bw_ == 8 && bh_ == 8;
+                if (full) {
+                    detail::fdct8x8(cur_.p[c].data() + off, stride, dct);
+                } else {
+                    load_partial_block(cur_.p[c].data() + off, stride, bw_, bh_, blk);
+                    detail::fdct8x8(blk, 8, dct);
+                }
+                int32_t ac_bits = 0;  // OR of the AC values, branch-free
                 for (int k = 0; k < 64; ++k) {
                     int nat = detail::kZigzag[k];
-                    int32_t d = int32_t(q[nat]) * 8;
-                    int32_t v = dct[nat];
-                    int32_t qv = v < 0 ? -((-v + d / 2) / d) : (v + d / 2) / d;
+                    int32_t qv = detail::quant_div(dct[nat], qdiv[k], qrecip[k]);
                     qv = std::min<int32_t>(1023, std::max<int32_t>(-1023, qv));
                     zz[k] = int16_t(qv);
                     // Shadow decode: same dequantization and clamp as decode_block().
                     deq[nat] = std::min<int32_t>(2047, std::max<int32_t>(-2048, qv * int32_t(q[nat])));
-                    if (k && qv) has_ac = true;
+                    if (k) ac_bits |= qv;
                 }
+                bool has_ac = ac_bits != 0;
                 detail::encode_block(bw, zz, pred, table);
-                uint8_t* dst = recon_.p[c].data() + off;
-                if (has_ac) detail::idct8x8(deq, dst, stride);
-                else detail::idct8x8_dc(deq[0], dst, stride);
+                uint8_t* dst = full ? recon_.p[c].data() + off : blk;
+                int dstride = full ? stride : 8;
+                if (has_ac) detail::idct8x8(deq, dst, dstride);
+                else detail::idct8x8_dc(deq[0], dst, dstride);
+                if (!full) store_partial_block(blk, recon_.p[c].data() + off, stride, bw_, bh_);
             }
         }
     }
@@ -1310,12 +1419,18 @@ void Encoder::encode_frame(const uint8_t* y, int ystride, const uint8_t* u, int 
     bool force = keyframe_request_ || policy_.forced(frame_index_);
     keyframe_request_ = false;
     int tiles = layout_.tiles;
+    int tile_area = layout_.tile_w * layout_.tile_h;
     if (force) {
         std::fill(dirty_.begin(), dirty_.end(), uint8_t(1));
     } else {
-        for (int t = 0; t < tiles; ++t) dirty_[size_t(t)] = tile_changed(t) ? 1 : 0;
+        parallel_for(tiles, std::max(1, 32768 / tile_area), [this](int b, int e, int) {
+            for (int t = b; t < e; ++t) dirty_[size_t(t)] = tile_changed(t) ? 1 : 0;
+        });
         policy_.apply(dirty_.data());
     }
+    dirty_list_.clear();
+    for (int t = 0; t < tiles; ++t)
+        if (dirty_[size_t(t)]) dirty_list_.push_back(t);
 
     uint8_t hdr[kFrameHeaderSize];
     put_u32(hdr, frame_num_);
@@ -1327,13 +1442,20 @@ void Encoder::encode_frame(const uint8_t* y, int ystride, const uint8_t* u, int 
         detail::pack_bitmap(dirty_.data(), tiles, out.data() + pos);
     }
 
-    uint32_t dirty_count = 0;
-    for (int t = 0; t < tiles; ++t) {
-        if (!dirty_[size_t(t)]) continue;
-        encode_tile(t, out);
-        copy_tile(cur_, last_coded_, t);
-        ++dirty_count;
-    }
+    // Tiles touch disjoint pixels, so they encode independently; each worker takes a
+    // contiguous run of dirty tiles and the runs are joined in raster order, which
+    // keeps the output identical for any thread count.
+    for (auto& w : worker_out_) w.clear();
+    parallel_for(int(dirty_list_.size()), std::max(1, 8192 / tile_area), [this](int b, int e, int worker) {
+        std::vector<uint8_t>& wout = worker_out_[size_t(worker)];
+        for (int i = b; i < e; ++i) {
+            int t = dirty_list_[size_t(i)];
+            encode_tile(t, wout);
+            copy_tile(cur_, last_coded_, t);
+        }
+    });
+    for (auto& w : worker_out_) out.insert(out.end(), w.begin(), w.end());
+    uint32_t dirty_count = uint32_t(dirty_list_.size());
 
     if (stats) {
         stats->frame_num = frame_num_;
