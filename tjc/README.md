@@ -23,6 +23,45 @@ or `cmake -B build && cmake --build build && ./build/tjc_test`.
 Optional: `ln -s tjc tjc_encode && ln -s tjc tjc_decode` lets you call the tool
 without the subcommand.
 
+## Windows
+
+Build with any of these (output: `tjc.exe`):
+
+```bat
+:: Visual Studio: "x64 Native Tools Command Prompt for VS"
+cl /std:c++17 /O2 /EHsc tjc.cpp
+
+:: MinGW-w64 / MSYS2
+g++ -std=c++17 -O2 -static -o tjc.exe tjc.cpp
+
+:: CMake (either toolchain)
+cmake -B build && cmake --build build --config Release
+```
+
+Get ffmpeg with `winget install Gyan.FFmpeg` (or a build from ffmpeg.org).
+
+**Run the pipes from `cmd.exe`, not Windows PowerShell 5.1.** PowerShell 5.1 sends
+pipe data through as text and corrupts binary video. It also has no `<` redirect.
+PowerShell 7.4+ passes bytes between programs unchanged, but still has no `<`, so
+use `-i`/`-o` there.
+
+```bat
+:: cmd.exe
+ffmpeg -i input.mp4 -f rawvideo -pix_fmt yuv420p -s 320x240 - | tjc encode --size 320x240 > stream.tjc
+tjc decode < stream.tjc | ffplay -f rawvideo -pix_fmt yuv420p -video_size 320x240 -
+```
+
+```powershell
+# PowerShell (7.4+ for the pipe; the -i/-o form works in any version)
+ffmpeg -i input.mp4 -f rawvideo -pix_fmt yuv420p -s 320x240 raw.yuv
+.\tjc encode --size 320x240 -i raw.yuv -o stream.tjc
+.\tjc decode -i stream.tjc -o out.yuv
+ffplay -f rawvideo -pix_fmt yuv420p -video_size 320x240 out.yuv
+```
+
+`copy tjc.exe tjc_encode.exe` (and `tjc_decode.exe`) gives the subcommand-free names,
+since Windows has no handy symlinks.
+
 ## Using the tool with ffmpeg
 
 Frames in and out are raw YUV420P, so the tool sits in an ffmpeg pipe.

@@ -25,6 +25,8 @@ static int g_checks = 0;
 
 using namespace tjc;
 
+static const double kPi = 3.14159265358979323846;
+
 static uint32_t g_rng = 12345;
 static uint32_t rnd() {
     g_rng = g_rng * 1664525u + 1013904223u;
@@ -37,8 +39,8 @@ static void ref_dct(const uint8_t* src, double out[64]) {
             double s = 0;
             for (int y = 0; y < 8; ++y)
                 for (int x = 0; x < 8; ++x)
-                    s += (src[y * 8 + x] - 128.0) * std::cos((2 * x + 1) * u * M_PI / 16) *
-                         std::cos((2 * y + 1) * v * M_PI / 16);
+                    s += (src[y * 8 + x] - 128.0) * std::cos((2 * x + 1) * u * kPi / 16) *
+                         std::cos((2 * y + 1) * v * kPi / 16);
             double cu = u ? 1 : std::sqrt(0.5), cv = v ? 1 : std::sqrt(0.5);
             out[v * 8 + u] = 0.25 * cu * cv * s;
         }
