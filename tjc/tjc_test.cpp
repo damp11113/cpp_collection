@@ -305,20 +305,37 @@ static void test_header() {
     h.refresh_mode = RefreshMode::FullPeriodic;
     h.refresh_param = 600;
     h.quality = 42;
+    h.fps_num = 30000;
+    h.fps_den = 1001;
+    h.audio_codec = 1;
+    h.audio_channels = 2;
+    h.audio_rate = 48000;
     uint8_t buf[kStreamHeaderSize];
     write_stream_header(h, buf);
-    CHECK(std::memcmp(buf, "TJC1", 4) == 0);
+    CHECK(std::memcmp(buf, "TJC2", 4) == 0);
 #if !TJC_STREAM_BIG_ENDIAN
     CHECK(buf[4] == (1918 & 255) && buf[5] == (1918 >> 8));
 #endif
     StreamHeader r;
-    CHECK(parse_stream_header(buf, &r) == Status::Ok);
+    CHECK(parse_stream_header(buf, kStreamHeaderSize, &r) == Status::Ok);
     CHECK(r.width == h.width && r.height == h.height && r.tile_w == 32 && r.tile_h == 48 &&
           r.refresh_mode == h.refresh_mode && r.refresh_param == 600 && r.quality == 42);
+    CHECK(r.version == 2 && r.fps_num == 30000 && r.fps_den == 1001 && r.audio_codec == 1 &&
+          r.audio_channels == 2 && r.audio_rate == 48000);
+    CHECK(parse_stream_header(buf, kStreamHeaderSizeV1, &r) == Status::Truncated);
     buf[8] = 0;  // tile width 0
-    CHECK(parse_stream_header(buf, &r) == Status::BadHeader);
+    CHECK(parse_stream_header(buf, kStreamHeaderSize, &r) == Status::BadHeader);
     buf[8] = 1;
-    CHECK(parse_stream_header(buf, &r) == Status::Ok);
+    CHECK(parse_stream_header(buf, kStreamHeaderSize, &r) == Status::Ok);
+    buf[27] = 9;  // too many audio channels
+    CHECK(parse_stream_header(buf, kStreamHeaderSize, &r) == Status::BadHeader);
+    buf[27] = 2;
+    buf[18] = buf[19] = buf[20] = buf[21] = 0;  // fps 0
+    CHECK(parse_stream_header(buf, kStreamHeaderSize, &r) == Status::BadHeader);
+    // A TJC1 header is the first 18 bytes with the old magic: 30 fps, no audio.
+    buf[3] = '1';
+    CHECK(parse_stream_header(buf, kStreamHeaderSizeV1, &r) == Status::Ok);
+    CHECK(r.version == 1 && r.fps_num == 30 && r.fps_den == 1 && r.audio_codec == 0);
     CHECK(validate_geometry(64, 64, 128, 128) != nullptr);  // payload could overflow tile_len
     CHECK(validate_geometry(64, 64, 112, 112) == nullptr);
 }
@@ -452,17 +469,218 @@ static void test_threads_deterministic() {
     }
 }
 
+static void make_audio(std::vector<int16_t>& a, size_t start, size_t n, int ch, uint32_t rate) {
+    a.resize(n * size_t(ch));
+    for (size_t i = 0; i < n; ++i)
+        for (int c = 0; c < ch; ++c) {
+            double t = double(start + i) / rate;
+            double v = 0.4 * std::sin(2 * kPi * (330 + 110 * c) * t) + 0.2 * std::sin(2 * kPi * 2093 * t) *
+                       (std::fmod(t, 0.25) < 0.05 ? 1.0 : 0.0);
+            a[i * size_t(ch) + size_t(c)] = int16_t(std::lround(v * 32767));
+        }
+}
+
+static double snr16(const int16_t* a, const int16_t* b, size_t n) {
+    double sig = 0, err = 0;
+    for (size_t i = 0; i < n; ++i) {
+        sig += double(a[i]) * a[i];
+        err += double(a[i] - b[i]) * (a[i] - b[i]);
+    }
+    return err == 0 ? 99.0 : 10 * std::log10(sig / err);
+}
+
+static void test_qoa() {
+    std::printf("qoa audio frames\n");
+    for (int ch : {1, 2, 8}) {
+        for (int len : {1, 19, 20, 21, 1000, detail::qoa::kMaxFrameLen}) {
+            std::vector<int16_t> src;
+            make_audio(src, 0, size_t(len) * 3, ch, 44100);
+            detail::qoa::Lms lms[8];
+            for (auto& l : lms) detail::qoa::init_lms(l);
+            std::vector<uint8_t> enc;
+            for (int f = 0; f < 3; ++f)
+                detail::qoa::encode_frame(src.data() + size_t(f) * size_t(len) * size_t(ch), ch, 44100, len, lms, enc);
+            CHECK(enc.size() == 3 * detail::qoa::frame_size(ch, len));
+            std::vector<int16_t> out(size_t(detail::qoa::kMaxFrameLen) * size_t(ch) * 3);
+            size_t pos = 0, got = 0;
+            bool ok = true;
+            for (int f = 0; f < 3; ++f) {
+                size_t used = 0;
+                int n = detail::qoa::decode_frame(enc.data() + pos, enc.size() - pos, ch, 44100,
+                                                  out.data() + got * size_t(ch), &used);
+                ok &= n == len;
+                if (n < 0) break;
+                pos += used;
+                got += size_t(n);
+            }
+            CHECK(ok && pos == enc.size());
+            // Very short frames are dominated by the predictor warming up.
+            if (len >= 1000) CHECK(snr16(src.data(), out.data(), src.size()) > 35.0);
+            // Wrong channel count or rate must be refused.
+            size_t used = 0;
+            CHECK(detail::qoa::decode_frame(enc.data(), enc.size(), ch == 1 ? 2 : 1, 44100, out.data(), &used) < 0);
+            CHECK(detail::qoa::decode_frame(enc.data(), enc.size(), ch, 48000, out.data(), &used) < 0);
+        }
+    }
+}
+
+// Video + audio through encoder and decoder: exact per-frame sample counts,
+// audio quality, and video still bit-exact.
+static void test_av(uint32_t fps_num, uint32_t fps_den, uint32_t rate, int ch, int frames, bool short_audio) {
+    Config cfg;
+    cfg.width = 96;
+    cfg.height = 64;
+    cfg.fps_num = fps_num;
+    cfg.fps_den = fps_den;
+    cfg.audio_channels = uint8_t(ch);
+    cfg.audio_rate = rate;
+    Encoder enc;
+    CHECK(enc.init(cfg));
+    const size_t total = size_t(uint64_t(frames) * rate * fps_den / fps_num);
+    const size_t provided = short_audio ? total / 2 : total + 777;
+    std::vector<int16_t> src;
+    make_audio(src, 0, provided, ch, rate);
+
+    std::vector<uint8_t> stream, f;
+    enc.write_stream_header(stream);
+    std::vector<std::vector<uint8_t>> recon(static_cast<size_t>(frames));
+    size_t pushed = 0;
+    uint64_t padded = 0;
+    for (int t = 0; t < frames; ++t) {
+        // Push in uneven chunks, sometimes ahead of what the frame needs.
+        size_t want = std::min(provided - pushed, enc.samples_for_next_frame() + (t % 3 == 0 ? 37 : 0));
+        enc.push_audio(src.data() + pushed * size_t(ch), want);
+        pushed += want;
+        make_frame(f, 96, 64, t);
+        FrameStats st;
+        enc.encode_frame(f.data(), stream, &st);
+        padded += st.audio_padded;
+        recon[size_t(t)].resize(f.size());
+        enc.copy_recon(recon[size_t(t)].data());
+    }
+
+    MemoryReader mr;
+    mr.data = stream.data();
+    mr.size = stream.size();
+    Decoder dec;
+    CHECK(dec.read_header(MemoryReader::read, &mr) == Status::Ok);
+    CHECK(dec.header().audio_codec == 1 && dec.header().audio_rate == rate);
+    std::vector<int16_t> audio;
+    std::vector<uint8_t> out(frame_size(96, 64));
+    bool counts_ok = true, video_ok = true;
+    int n = 0;
+    FrameStats st;
+    while (dec.decode_frame(MemoryReader::read, &mr, &st) == Status::Ok) {
+        size_t expect = size_t(uint64_t(n + 1) * rate * fps_den / fps_num - uint64_t(n) * rate * fps_den / fps_num);
+        counts_ok &= dec.audio_samples() == expect && st.audio_samples == expect;
+        audio.insert(audio.end(), dec.audio(), dec.audio() + dec.audio_samples() * size_t(ch));
+        dec.copy_frame(out.data());
+        video_ok &= out == recon[size_t(n)];
+        ++n;
+    }
+    CHECK(n == frames);
+    CHECK(counts_ok);
+    CHECK(video_ok);
+    CHECK(audio.size() == total * size_t(ch));
+    size_t real = std::min(total, provided) * size_t(ch);
+    double q = snr16(src.data(), audio.data(), real);
+    CHECK(q > 35.0);
+    // Padding is digital silence; QOA is lossy, so after the predictor settles it
+    // decodes to within a few LSB of zero.
+    bool silence = true;
+    for (size_t i = real + 200 * size_t(ch); i < audio.size(); ++i) silence &= std::abs(audio[i]) <= 8;
+    CHECK(silence);
+    CHECK(padded == (short_audio ? total - provided : 0));
+    std::printf("  %u/%u fps, %u Hz x%d, %d frames: %zu samples, SNR %.1f dB%s\n", fps_num, fps_den, rate, ch, frames,
+                total, q, short_audio ? ", short audio padded with silence" : "");
+}
+
+static void test_audio_video() {
+    std::printf("audio + video\n");
+    test_av(30000, 1001, 48000, 2, 90, false);
+    test_av(25, 1, 44100, 1, 50, false);
+    test_av(24000, 1001, 22050, 6, 40, true);
+    test_av(1, 2, 8000, 1, 3, false);  // 0.5 fps: 16000 samples per frame, several QOA frames each
+}
+
+static void test_sync_drift() {
+    std::printf("no audio drift over a long run\n");
+    Config cfg;
+    cfg.width = cfg.height = 16;
+    cfg.fps_num = 30000;
+    cfg.fps_den = 1001;
+    cfg.audio_channels = 1;
+    cfg.audio_rate = 1000;
+    cfg.threads = 1;
+    Encoder enc;
+    CHECK(enc.init(cfg));
+    std::vector<uint8_t> frame(frame_size(16, 16), 128), out;
+    std::vector<int16_t> zeros(64, 0);
+    uint64_t sum = 0;
+    bool ok = true;
+    const int frames = 20000;
+    for (int t = 0; t < frames; ++t) {
+        enc.push_audio(zeros.data(), enc.samples_for_next_frame());
+        FrameStats st;
+        out.clear();
+        enc.encode_frame(frame.data(), out, &st);
+        sum += st.audio_samples;
+        ok &= sum == uint64_t(t + 1) * 1000 * 1001 / 30000;
+    }
+    CHECK(ok);
+}
+
+static void test_tjc1_compat() {
+    std::printf("TJC1 streams still decode\n");
+    Config cfg;
+    cfg.width = 80;
+    cfg.height = 48;
+    Encoder enc;
+    CHECK(enc.init(cfg));
+    std::vector<uint8_t> v2, f;
+    enc.write_stream_header(v2);
+    for (int t = 0; t < 5; ++t) {
+        make_frame(f, 80, 48, t);
+        enc.encode_frame(f.data(), v2);
+    }
+    // Without audio, a TJC1 stream is the TJC2 one minus the 16 extra header bytes.
+    std::vector<uint8_t> v1(v2.begin(), v2.begin() + kStreamHeaderSizeV1);
+    v1[3] = '1';
+    v1.insert(v1.end(), v2.begin() + kStreamHeaderSize, v2.end());
+    std::vector<uint8_t> a(frame_size(80, 48)), b(a.size());
+    MemoryReader r1{v1.data(), v1.size(), 0}, r2{v2.data(), v2.size(), 0};
+    Decoder d1, d2;
+    CHECK(d1.read_header(MemoryReader::read, &r1) == Status::Ok);
+    CHECK(d2.read_header(MemoryReader::read, &r2) == Status::Ok);
+    CHECK(d1.header().version == 1 && d1.header().audio_codec == 0);
+    int frames = 0;
+    bool same = true;
+    while (d1.decode_frame(MemoryReader::read, &r1) == Status::Ok) {
+        CHECK(d2.decode_frame(MemoryReader::read, &r2) == Status::Ok);
+        d1.copy_frame(a.data());
+        d2.copy_frame(b.data());
+        same &= a == b && d1.audio_samples() == 0;
+        ++frames;
+    }
+    CHECK(frames == 5 && same);
+}
+
 static void test_corrupt_input() {
     std::printf("corrupt / truncated input\n");
     Config cfg;
     cfg.width = 64;
     cfg.height = 48;
+    cfg.audio_channels = 2;
+    cfg.audio_rate = 44100;
     Encoder enc;
     CHECK(enc.init(cfg));
     std::vector<uint8_t> stream, f;
+    std::vector<int16_t> pcm;
     enc.write_stream_header(stream);
     for (int t = 0; t < 4; ++t) {
         make_frame(f, 64, 48, t);
+        make_audio(pcm, size_t(t) * 1470, enc.samples_for_next_frame(), 2, 44100);
+        enc.push_audio(pcm.data(), pcm.size() / 2);
         enc.encode_frame(f.data(), stream);
     }
     // Truncation at every possible length must never crash and never report Ok past the end.
@@ -490,7 +708,7 @@ static void test_corrupt_input() {
         }
         errors += st != Status::EndOfStream;
     }
-    std::printf("  %d/300 damaged streams reported an error (rest decoded with garbage pixels)\n", errors);
+    std::printf("  %d/300 damaged streams reported an error (rest decoded to garbage pixels/audio)\n", errors);
     CHECK(errors > 0);
 }
 
@@ -506,6 +724,10 @@ int main() {
     test_quant_div();
     test_pipeline();
     test_threads_deterministic();
+    test_qoa();
+    test_audio_video();
+    test_sync_drift();
+    test_tjc1_compat();
     test_corrupt_input();
     std::printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;

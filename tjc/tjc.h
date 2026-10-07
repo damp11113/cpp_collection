@@ -1,9 +1,11 @@
-// tjc.h - Tiled-JPEG Codec (stream format "TJC1"), single-header C++17 library.
+// tjc.h - Tiled-JPEG Codec (stream format "TJC2"), single-header C++17 library.
 //
 // A frame is split into fixed-size tiles. Each frame only carries the tiles that
 // changed (plus tiles picked by the refresh policy); every carried tile is coded as
 // a small baseline-JPEG-style blob (integer DCT, static quant tables, static JPEG
 // Huffman tables). The decoder keeps a persistent framebuffer and patches it.
+// An optional audio track is interleaved per video frame, coded with QOA ("Quite OK
+// Audio", integer-only; see the QOA section below for its license notice).
 //
 // Usage: in exactly ONE .cpp file
 //     #define TJC_IMPLEMENTATION
@@ -18,13 +20,15 @@
 //
 // The decode path is integer-only and deterministic: the same stream gives
 // bit-identical output on every platform, and the encoder's internal
-// reconstruction is bit-identical to what the decoder produces.
+// reconstruction is bit-identical to what the decoder produces. The same holds
+// for audio.
 //
 // ---------------------------------------------------------------------------
 // Stream format (all multi-byte fields little-endian unless TJC_STREAM_BIG_ENDIAN)
 //
-//   Stream header, 18 bytes, once:
-//     magic         4  "TJC1"
+//   Stream header, once. "TJC2" streams have 34 bytes; "TJC1" streams (no frame
+//   rate, no audio) have only the first 18 and are still decoded.
+//     magic         4  "TJC2" (or "TJC1")
 //     width         2  pixels (luma)
 //     height        2  pixels (luma)
 //     tile_w        1  1..255 (see "Tiles" below)
@@ -34,6 +38,13 @@
 //     refresh_param 2  N for FULL_PERIODIC, tiles per frame for ROLLING
 //     quality       1  1..100, selects the quant tables (was reserved byte 0)
 //     reserved      3  zero
+//     -- TJC2 only --
+//     fps_num       4  frame rate numerator   (e.g. 30000)
+//     fps_den       4  frame rate denominator (e.g. 1001)
+//     audio_codec   1  0 = none, 1 = QOA
+//     audio_chans   1  1..8
+//     audio_rate    4  sample rate in Hz, 1..16777215
+//     reserved      2  zero
 //
 //   Per frame:
 //     frame_num     4  uint32
@@ -43,6 +54,12 @@
 //     per dirty tile, raster order:
 //       tile_len    2  payload size in bytes (1..65535)
 //       payload     tile_len bytes
+//     audio, only when audio_codec != 0:
+//       audio_len   4  bytes of audio data that follow (may be 0)
+//       audio data  standard QOA frames (big-endian, as in the QOA spec), each
+//                   holding up to 5120 samples per channel. Together they carry
+//                   the samples that play during this video frame: frame n ends at
+//                   sample floor((n+1) * audio_rate * fps_den / fps_num).
 //
 //   Tile payload: Huffman-coded 8x8 blocks, MSB-first bit packing, zero-padded to a
 //   byte, no marker byte stuffing. Block order: all Y blocks of the tile (raster),
@@ -77,7 +94,8 @@
 
 namespace tjc {
 
-constexpr int kStreamHeaderSize = 18;
+constexpr int kStreamHeaderSize = 34;    // TJC2
+constexpr int kStreamHeaderSizeV1 = 18;  // TJC1
 constexpr int kFrameHeaderSize = 5;  // without the bitmap
 constexpr int kMaxTilePayload = 65535;
 
@@ -114,6 +132,15 @@ struct Config {
     // Encoder worker threads, 0 = one per hardware thread. The output does not
     // depend on this value. Ignored with TJC_NO_THREADS.
     int threads = 0;
+
+    // Frame rate, stored in the stream; also sets how many audio samples go with
+    // each frame.
+    uint32_t fps_num = 30;
+    uint32_t fps_den = 1;
+
+    // Audio track: 0 channels = no audio. Feed samples with Encoder::push_audio().
+    uint8_t audio_channels = 0;
+    uint32_t audio_rate = 0;
 };
 
 struct StreamHeader {
@@ -125,6 +152,12 @@ struct StreamHeader {
     RefreshMode refresh_mode = RefreshMode::None;
     uint16_t refresh_param = 0;
     uint8_t quality = 0;
+    uint8_t version = 2;      // 1 = TJC1 (fields below absent: 30 fps, no audio)
+    uint32_t fps_num = 30;
+    uint32_t fps_den = 1;
+    uint8_t audio_codec = 0;  // 0 = none, 1 = QOA
+    uint8_t audio_channels = 0;
+    uint32_t audio_rate = 0;
 };
 
 struct FrameStats {
@@ -132,7 +165,10 @@ struct FrameStats {
     bool force_refresh = false;
     uint32_t dirty_tiles = 0;
     uint32_t total_tiles = 0;
-    size_t bytes = 0;  // encoded size of the frame record
+    size_t bytes = 0;            // encoded size of the frame record, audio included
+    uint32_t audio_samples = 0;  // samples per channel carried by this frame
+    size_t audio_bytes = 0;      // audio_len
+    uint32_t audio_padded = 0;   // encoder: samples of silence added because push_audio() ran short
 };
 
 enum class Status {
@@ -179,8 +215,11 @@ const char* validate_geometry(int width, int height, int tile_w, int tile_h);
 
 Layout make_layout(int width, int height, int tile_w, int tile_h);
 
+// Writes a TJC2 header (kStreamHeaderSize bytes).
 void write_stream_header(const StreamHeader& h, uint8_t out[kStreamHeaderSize]);
-Status parse_stream_header(const uint8_t in[kStreamHeaderSize], StreamHeader* h);
+// Parses a TJC1 header (size >= kStreamHeaderSizeV1) or TJC2 header
+// (size >= kStreamHeaderSize). Returns Truncated if more bytes are needed.
+Status parse_stream_header(const uint8_t* in, size_t size, StreamHeader* h);
 
 // Low-level building blocks, exposed for tests and for anyone porting the hot loops.
 namespace detail {
@@ -308,6 +347,38 @@ private:
     int cursor_ = 0;
 };
 
+// QOA audio frames (https://qoaformat.org). Bit-compatible with the reference
+// qoa.h; frames are self-contained (each carries its predictor state).
+namespace qoa {
+
+constexpr int kSliceLen = 20;
+constexpr int kMaxFrameLen = 256 * kSliceLen;  // samples per channel per frame
+constexpr int kMaxChannels = 8;
+
+struct Lms {
+    int32_t history[4];
+    int32_t weights[4];
+};
+
+// Initial predictor state used by the reference encoder.
+void init_lms(Lms& lms);
+
+size_t frame_size(int channels, int samples);
+
+// Encodes 1..kMaxFrameLen interleaved samples per channel as one frame appended
+// to out. lms (one per channel) carries the state from frame to frame; after the
+// call it equals what a decoder reads from the next frame's header.
+void encode_frame(const int16_t* interleaved, int channels, uint32_t rate, int samples, Lms* lms,
+                  std::vector<uint8_t>& out);
+
+// Decodes one frame at data. On success returns the samples per channel written
+// to out (interleaved, room for kMaxFrameLen * channels needed) and sets *consumed;
+// returns -1 for malformed data or a channel count / rate other than expected.
+int decode_frame(const uint8_t* data, size_t size, int channels, uint32_t rate, int16_t* out,
+                 size_t* consumed);
+
+}  // namespace qoa
+
 }  // namespace detail
 
 // Padded planar YUV420P storage used by both encoder and decoder.
@@ -319,8 +390,8 @@ struct Planes {
 
 class Decoder {
 public:
-    // Reads and validates the 18-byte stream header, allocates the framebuffer
-    // (initialized to black). Must be called first.
+    // Reads and validates the stream header (TJC1 or TJC2), allocates the
+    // framebuffer (initialized to black). Must be called first.
     Status read_header(ReadFn fn, void* user);
 
     // Reads and applies one frame record. Returns EndOfStream at clean EOF.
@@ -336,14 +407,22 @@ public:
     const uint8_t* plane(int c) const { return fb_.p[c].data(); }
     int stride(int c) const { return fb_.stride[c]; }
 
+    // Audio that belongs to the last decoded frame: audio_samples() samples per
+    // channel, interleaved, header().audio_channels channels. Empty without audio.
+    const int16_t* audio() const { return audio_.data(); }
+    size_t audio_samples() const { return audio_samples_; }
+
 private:
     bool decode_tile(const uint8_t* data, size_t size, int tile);
+    Status decode_audio(ReadFn fn, void* user, size_t* bytes);
 
     StreamHeader header_;
     Layout layout_;
     Planes fb_;
     uint16_t dq_[2][64] = {};  // dequant tables, zigzag order
     std::vector<uint8_t> dirty_, bitmap_, payload_;
+    std::vector<int16_t> audio_;
+    size_t audio_samples_ = 0;
     bool ready_ = false;
 };
 
@@ -374,6 +453,13 @@ public:
     // Make the next frame a full refresh (e.g. a new receiver joined).
     void force_keyframe() { keyframe_request_ = true; }
 
+    // Queues interleaved audio (config().audio_channels channels). Each
+    // encode_frame() takes samples_for_next_frame() samples per channel from the
+    // queue, padding with silence if it runs short. Push ahead of the video.
+    void push_audio(const int16_t* interleaved, size_t samples_per_channel);
+    size_t samples_for_next_frame() const;
+    size_t queued_audio() const { return audio_queue_.size() / (cfg_.audio_channels ? cfg_.audio_channels : 1); }
+
     // The encoder's shadow copy of the decoder framebuffer, as tightly packed YUV420P.
     void copy_recon(uint8_t* dst) const;
 
@@ -398,6 +484,9 @@ private:
     uint32_t frame_num_ = 0;
     uint32_t frame_index_ = 0;
     bool keyframe_request_ = false;
+    std::vector<int16_t> audio_queue_;
+    detail::qoa::Lms audio_lms_[detail::qoa::kMaxChannels] = {};
+    uint64_t audio_rem_ = 0;  // remainder of the samples-per-frame division
     bool ready_ = false;
     const char* error_ = "not initialized";
 };
@@ -634,7 +723,7 @@ Layout make_layout(int width, int height, int tile_w, int tile_h) {
 
 void write_stream_header(const StreamHeader& h, uint8_t out[kStreamHeaderSize]) {
     std::memset(out, 0, kStreamHeaderSize);
-    out[0] = 'T'; out[1] = 'J'; out[2] = 'C'; out[3] = '1';
+    out[0] = 'T'; out[1] = 'J'; out[2] = 'C'; out[3] = '2';
     put_u16(out + 4, h.width);
     put_u16(out + 6, h.height);
     out[8] = h.tile_w;
@@ -643,11 +732,32 @@ void write_stream_header(const StreamHeader& h, uint8_t out[kStreamHeaderSize]) 
     out[11] = uint8_t(h.refresh_mode);
     put_u16(out + 12, h.refresh_param);
     out[14] = h.quality;
+    put_u32(out + 18, h.fps_num);
+    put_u32(out + 22, h.fps_den);
+    out[26] = h.audio_codec;
+    out[27] = h.audio_codec ? h.audio_channels : 0;
+    put_u32(out + 28, h.audio_codec ? h.audio_rate : 0);
 }
 
-Status parse_stream_header(const uint8_t in[kStreamHeaderSize], StreamHeader* h) {
-    if (in[0] != 'T' || in[1] != 'J' || in[2] != 'C' || in[3] != '1') return Status::BadHeader;
+Status parse_stream_header(const uint8_t* in, size_t size, StreamHeader* h) {
+    if (size < 4) return Status::Truncated;
+    if (in[0] != 'T' || in[1] != 'J' || in[2] != 'C' || (in[3] != '1' && in[3] != '2')) return Status::BadHeader;
     StreamHeader r;
+    r.version = uint8_t(in[3] - '0');
+    if (size < size_t(r.version == 1 ? kStreamHeaderSizeV1 : kStreamHeaderSize)) return Status::Truncated;
+    if (r.version == 2) {
+        r.fps_num = get_u32(in + 18);
+        r.fps_den = get_u32(in + 22);
+        r.audio_codec = in[26];
+        if (r.fps_num == 0 || r.fps_den == 0 || r.audio_codec > 1) return Status::BadHeader;
+        if (r.audio_codec) {
+            r.audio_channels = in[27];
+            r.audio_rate = get_u32(in + 28);
+            if (r.audio_channels < 1 || r.audio_channels > detail::qoa::kMaxChannels || r.audio_rate < 1 ||
+                r.audio_rate > 0xffffff)
+                return Status::BadHeader;
+        }
+    }
     r.width = uint16_t(get_u16(in + 4));
     r.height = uint16_t(get_u16(in + 6));
     r.tile_w = in[8];
@@ -1094,6 +1204,215 @@ void RefreshPolicy::apply(uint8_t* dirty) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// QOA audio
+//
+// Port of the QOA reference coder (https://github.com/phoboslab/qoa):
+//   Copyright (c) 2023, Dominic Szablewski - https://phoboslab.org
+//   SPDX-License-Identifier: MIT
+//   Permission is hereby granted, free of charge, to any person obtaining a copy
+//   of this software and associated documentation files (the "Software"), to deal
+//   in the Software without restriction, including without limitation the rights
+//   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+//   copies of the Software, and to permit persons to whom the Software is
+//   furnished to do so, subject to the following conditions: The above copyright
+//   notice and this permission notice shall be included in all copies or
+//   substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS",
+//   WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED.
+//
+// Differences from the reference, none of which change valid streams:
+//   - The encoder continues each frame from the int16 predictor state it wrote
+//     into the frame header, so it always matches the decoder exactly.
+//   - Sums that could overflow 32 bits on hostile input use 64 bits.
+// ---------------------------------------------------------------------------
+namespace qoa {
+namespace {
+
+const int32_t kReciprocal[16] = {65536, 9363, 3121, 1457, 781, 475, 311, 216,
+                                 156,   117,  90,   71,   57,  47,  39,  32};
+const uint8_t kQuant[17] = {7, 7, 7, 5, 5, 3, 3, 1, 0, 0, 2, 2, 4, 4, 6, 6, 6};  // index: clamped residual + 8
+const int16_t kDequant[16][8] = {
+    {1, -1, 3, -3, 5, -5, 7, -7},
+    {5, -5, 18, -18, 32, -32, 49, -49},
+    {16, -16, 53, -53, 95, -95, 147, -147},
+    {34, -34, 113, -113, 203, -203, 315, -315},
+    {63, -63, 210, -210, 378, -378, 588, -588},
+    {104, -104, 345, -345, 621, -621, 966, -966},
+    {158, -158, 528, -528, 950, -950, 1477, -1477},
+    {228, -228, 760, -760, 1368, -1368, 2128, -2128},
+    {316, -316, 1053, -1053, 1895, -1895, 2947, -2947},
+    {422, -422, 1405, -1405, 2529, -2529, 3934, -3934},
+    {548, -548, 1828, -1828, 3290, -3290, 5117, -5117},
+    {696, -696, 2320, -2320, 4176, -4176, 6496, -6496},
+    {868, -868, 2893, -2893, 5207, -5207, 8099, -8099},
+    {1064, -1064, 3548, -3548, 6386, -6386, 9933, -9933},
+    {1286, -1286, 4288, -4288, 7718, -7718, 12005, -12005},
+    {1536, -1536, 5120, -5120, 9216, -9216, 14336, -14336},
+};
+
+inline int32_t predict(const Lms& l) {
+    int64_t p = 0;
+    for (int i = 0; i < 4; ++i) p += int64_t(l.weights[i]) * l.history[i];
+    p >>= 13;
+    // Valid streams stay far inside this range; it only tames hostile input.
+    return int32_t(std::min<int64_t>(1 << 24, std::max<int64_t>(-(1 << 24), p)));
+}
+
+inline void update(Lms& l, int32_t sample, int32_t residual) {
+    int32_t delta = residual >> 4;
+    for (int i = 0; i < 4; ++i) l.weights[i] += l.history[i] < 0 ? -delta : delta;
+    l.history[0] = l.history[1];
+    l.history[1] = l.history[2];
+    l.history[2] = l.history[3];
+    l.history[3] = sample;
+}
+
+inline int32_t clamp_s16(int32_t v) { return v < -32768 ? -32768 : (v > 32767 ? 32767 : v); }
+
+// Rounding division by a scalefactor that never rounds a non-zero value to zero.
+inline int32_t div_sf(int32_t v, int sf) {
+    int32_t n = int32_t((int64_t(v) * kReciprocal[sf] + (1 << 15)) >> 16);
+    return n + ((v > 0) - (v < 0)) - ((n > 0) - (n < 0));
+}
+
+inline void put_u64(std::vector<uint8_t>& out, uint64_t v) {
+    for (int i = 56; i >= 0; i -= 8) out.push_back(uint8_t(v >> i));
+}
+
+inline uint64_t get_u64(const uint8_t* p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v = (v << 8) | p[i];
+    return v;
+}
+
+}  // namespace
+
+void init_lms(Lms& lms) {
+    for (int i = 0; i < 4; ++i) lms.history[i] = 0;
+    lms.weights[0] = 0;
+    lms.weights[1] = 0;
+    lms.weights[2] = -(1 << 13);
+    lms.weights[3] = 1 << 14;
+}
+
+size_t frame_size(int channels, int samples) {
+    size_t slices = size_t(samples + kSliceLen - 1) / kSliceLen;
+    return 8 + 16 * size_t(channels) + 8 * slices * size_t(channels);
+}
+
+void encode_frame(const int16_t* interleaved, int channels, uint32_t rate, int samples, Lms* lms,
+                  std::vector<uint8_t>& out) {
+    out.reserve(out.size() + frame_size(channels, samples));
+    put_u64(out, uint64_t(channels) << 56 | uint64_t(rate) << 32 | uint64_t(samples) << 16 |
+                     uint64_t(frame_size(channels, samples)));
+    for (int c = 0; c < channels; ++c) {
+        uint64_t history = 0, weights = 0;
+        for (int i = 0; i < 4; ++i) {
+            // Continue from exactly what the decoder will read.
+            lms[c].history[i] = int16_t(lms[c].history[i]);
+            lms[c].weights[i] = int16_t(lms[c].weights[i]);
+            history = (history << 16) | (uint32_t(lms[c].history[i]) & 0xffff);
+            weights = (weights << 16) | (uint32_t(lms[c].weights[i]) & 0xffff);
+        }
+        put_u64(out, history);
+        put_u64(out, weights);
+    }
+
+    int prev_sf[kMaxChannels] = {};
+    for (int start = 0; start < samples; start += kSliceLen) {
+        int len = std::min(kSliceLen, samples - start);
+        for (int c = 0; c < channels; ++c) {
+            // Try all 16 scalefactors (starting from the last slice's) and keep the
+            // one with the least error.
+            uint64_t best_rank = ~uint64_t(0), best_slice = 0;
+            Lms best_lms = lms[c];
+            int best_sf = 0;
+            for (int i = 0; i < 16; ++i) {
+                int sf = (i + prev_sf[c]) & 15;
+                Lms l = lms[c];
+                uint64_t slice = uint64_t(sf), rank = 0;
+                int k = 0;
+                for (; k < len; ++k) {
+                    int32_t sample = interleaved[size_t(start + k) * channels + c];
+                    int32_t predicted = predict(l);
+                    int32_t residual = sample - predicted;
+                    int32_t scaled = std::min(8, std::max(-8, div_sf(residual, sf)));
+                    int quantized = kQuant[scaled + 8];
+                    int32_t dequantized = kDequant[sf][quantized];
+                    int32_t reconstructed = clamp_s16(predicted + dequantized);
+                    // Penalize runaway weights; avoids pops in some problem signals.
+                    int64_t wp = ((int64_t(l.weights[0]) * l.weights[0] + int64_t(l.weights[1]) * l.weights[1] +
+                                   int64_t(l.weights[2]) * l.weights[2] + int64_t(l.weights[3]) * l.weights[3]) >>
+                                  18) - 0x8ff;
+                    if (wp < 0) wp = 0;
+                    int64_t err = sample - reconstructed;
+                    rank += uint64_t(err * err) + uint64_t(wp * wp);
+                    if (rank > best_rank) break;
+                    update(l, reconstructed, dequantized);
+                    slice = (slice << 3) | uint64_t(quantized);
+                }
+                if (k == len && rank < best_rank) {
+                    best_rank = rank;
+                    best_slice = slice;
+                    best_lms = l;
+                    best_sf = sf;
+                }
+            }
+            prev_sf[c] = best_sf;
+            lms[c] = best_lms;
+            put_u64(out, best_slice << ((kSliceLen - len) * 3));
+        }
+    }
+}
+
+int decode_frame(const uint8_t* data, size_t size, int channels, uint32_t rate, int16_t* out,
+                 size_t* consumed) {
+    size_t header_size = 8 + 16 * size_t(channels);
+    if (size < header_size) return -1;
+    uint64_t fh = get_u64(data);
+    int fch = int(fh >> 56);
+    uint32_t frate = uint32_t(fh >> 32) & 0xffffff;
+    int samples = int(fh >> 16) & 0xffff;
+    size_t fsize = size_t(fh & 0xffff);
+    int slices = (samples + kSliceLen - 1) / kSliceLen;
+    if (fch != channels || frate != rate || samples < 1 || slices > 256 || fsize > size ||
+        fsize < header_size + 8 * size_t(slices) * size_t(channels))
+        return -1;
+
+    Lms lms[kMaxChannels];
+    const uint8_t* p = data + 8;
+    for (int c = 0; c < channels; ++c, p += 16) {
+        uint64_t history = get_u64(p), weights = get_u64(p + 8);
+        for (int i = 0; i < 4; ++i) {
+            lms[c].history[i] = int16_t(history >> 48);
+            lms[c].weights[i] = int16_t(weights >> 48);
+            history <<= 16;
+            weights <<= 16;
+        }
+    }
+    for (int start = 0; start < samples; start += kSliceLen) {
+        int len = std::min(kSliceLen, samples - start);
+        for (int c = 0; c < channels; ++c, p += 8) {
+            uint64_t slice = get_u64(p);
+            int sf = int(slice >> 60);
+            slice <<= 4;
+            int16_t* o = out + size_t(start) * channels + c;
+            for (int k = 0; k < len; ++k, o += channels) {
+                int32_t predicted = predict(lms[c]);
+                int32_t dequantized = kDequant[sf][int(slice >> 61)];
+                int32_t reconstructed = clamp_s16(predicted + dequantized);
+                *o = int16_t(reconstructed);
+                slice <<= 3;
+                update(lms[c], reconstructed, dequantized);
+            }
+        }
+    }
+    *consumed = fsize;
+    return samples;
+}
+
+}  // namespace qoa
+
 }  // namespace detail
 
 // ---------------------------------------------------------------------------
@@ -1102,10 +1421,14 @@ void RefreshPolicy::apply(uint8_t* dirty) {
 Status Decoder::read_header(ReadFn fn, void* user) {
     ready_ = false;
     uint8_t buf[kStreamHeaderSize];
-    size_t n = read_full(fn, user, buf, sizeof(buf));
+    size_t n = read_full(fn, user, buf, kStreamHeaderSizeV1);
     if (n == 0) return Status::EndOfStream;
-    if (n < sizeof(buf)) return Status::Truncated;
-    Status st = parse_stream_header(buf, &header_);
+    if (n < size_t(kStreamHeaderSizeV1)) return Status::Truncated;
+    if (buf[3] == '2') {
+        n += read_full(fn, user, buf + n, size_t(kStreamHeaderSize - kStreamHeaderSizeV1));
+        if (n < size_t(kStreamHeaderSize)) return Status::Truncated;
+    }
+    Status st = parse_stream_header(buf, n, &header_);
     if (st != Status::Ok) return st;
     if (uint64_t(header_.width) * header_.height > uint64_t(TJC_MAX_PIXELS)) return Status::BadHeader;
 
@@ -1120,10 +1443,54 @@ Status Decoder::read_header(ReadFn fn, void* user) {
     try {
         dirty_.assign(size_t(layout_.tiles), 0);
         bitmap_.assign(size_t(layout_.tiles + 7) / 8, 0);
+        audio_.clear();
     } catch (...) {
         return Status::OutOfMemory;
     }
+    audio_samples_ = 0;
     ready_ = true;
+    return Status::Ok;
+}
+
+Status Decoder::decode_audio(ReadFn fn, void* user, size_t* bytes) {
+    audio_samples_ = 0;
+    uint8_t lb[4];
+    if (read_full(fn, user, lb, 4) < 4) return Status::Truncated;
+    size_t len = get_u32(lb);
+    *bytes += 4 + len;
+    // A frame never needs more than about one frame period of samples; allow plenty
+    // of slack but refuse absurd sizes from damaged input.
+    const size_t ch = header_.audio_channels;
+    uint64_t expect = uint64_t(header_.audio_rate) * header_.fps_den / header_.fps_num + 1;
+    uint64_t max_samples = 2 * expect + detail::qoa::kMaxFrameLen;
+    if (len > detail::qoa::frame_size(int(ch), detail::qoa::kMaxFrameLen) * (max_samples / detail::qoa::kMaxFrameLen + 1))
+        return Status::Corrupt;
+    if (payload_.size() < len) {
+        try {
+            payload_.resize(len);
+        } catch (...) {
+            return Status::OutOfMemory;
+        }
+    }
+    if (read_full(fn, user, payload_.data(), len) < len) return Status::Truncated;
+    size_t pos = 0;
+    while (pos < len) {
+        if (audio_samples_ + detail::qoa::kMaxFrameLen > max_samples) return Status::Corrupt;
+        size_t need = (audio_samples_ + detail::qoa::kMaxFrameLen) * ch;
+        if (audio_.size() < need) {
+            try {
+                audio_.resize(need);
+            } catch (...) {
+                return Status::OutOfMemory;
+            }
+        }
+        size_t used = 0;
+        int got = detail::qoa::decode_frame(payload_.data() + pos, len - pos, int(ch), header_.audio_rate,
+                                            audio_.data() + audio_samples_ * ch, &used);
+        if (got < 0) return Status::Corrupt;
+        audio_samples_ += size_t(got);
+        pos += used;
+    }
     return Status::Ok;
 }
 
@@ -1196,12 +1563,21 @@ Status Decoder::decode_frame(ReadFn fn, void* user, FrameStats* stats) {
         ++dirty_count;
     }
 
+    size_t video_bytes = bytes;
+    if (header_.audio_codec) {
+        Status st = decode_audio(fn, user, &bytes);
+        if (st != Status::Ok) return st;
+    }
+
     if (stats) {
         stats->frame_num = frame_num;
         stats->force_refresh = force;
         stats->dirty_tiles = dirty_count;
         stats->total_tiles = uint32_t(layout_.tiles);
         stats->bytes = bytes;
+        stats->audio_samples = uint32_t(audio_samples_);
+        stats->audio_bytes = header_.audio_codec ? bytes - video_bytes - 4 : 0;
+        stats->audio_padded = 0;
     }
     return Status::Ok;
 }
@@ -1230,6 +1606,15 @@ bool Encoder::init(const Config& cfg) {
         error_ = "invalid refresh mode or diff reference";
         return false;
     }
+    if (cfg.fps_num == 0 || cfg.fps_den == 0) {
+        error_ = "frame rate numerator and denominator must be non-zero";
+        return false;
+    }
+    if (cfg.audio_channels > detail::qoa::kMaxChannels ||
+        (cfg.audio_channels && (cfg.audio_rate < 1 || cfg.audio_rate > 0xffffff))) {
+        error_ = "audio needs 1..8 channels and a sample rate of 1..16777215 Hz";
+        return false;
+    }
     cfg_ = cfg;
     layout_ = make_layout(cfg.width, cfg.height, cfg.tile_w, cfg.tile_h);
     if (!cur_.alloc(layout_) || !last_coded_.alloc(layout_) || !recon_.alloc(layout_)) {
@@ -1256,6 +1641,9 @@ bool Encoder::init(const Config& cfg) {
     frame_num_ = 0;
     frame_index_ = 0;
     keyframe_request_ = false;
+    audio_queue_.clear();
+    audio_rem_ = 0;
+    for (auto& l : audio_lms_) detail::qoa::init_lms(l);
     error_ = nullptr;
     ready_ = true;
     return true;
@@ -1291,7 +1679,23 @@ StreamHeader Encoder::stream_header() const {
     h.refresh_mode = cfg_.refresh_mode;
     h.refresh_param = uint16_t(cfg_.refresh_param);
     h.quality = cfg_.quality;
+    h.version = 2;
+    h.fps_num = cfg_.fps_num;
+    h.fps_den = cfg_.fps_den;
+    h.audio_codec = cfg_.audio_channels ? 1 : 0;
+    h.audio_channels = cfg_.audio_channels;
+    h.audio_rate = cfg_.audio_rate;
     return h;
+}
+
+void Encoder::push_audio(const int16_t* interleaved, size_t samples_per_channel) {
+    if (!cfg_.audio_channels) return;
+    audio_queue_.insert(audio_queue_.end(), interleaved, interleaved + samples_per_channel * cfg_.audio_channels);
+}
+
+size_t Encoder::samples_for_next_frame() const {
+    if (!cfg_.audio_channels) return 0;
+    return size_t((audio_rem_ + uint64_t(cfg_.audio_rate) * cfg_.fps_den) / cfg_.fps_num);
 }
 
 void Encoder::write_stream_header(std::vector<uint8_t>& out) const {
@@ -1457,12 +1861,38 @@ void Encoder::encode_frame(const uint8_t* y, int ystride, const uint8_t* u, int 
     for (auto& w : worker_out_) out.insert(out.end(), w.begin(), w.end());
     uint32_t dirty_count = uint32_t(dirty_list_.size());
 
+    // Audio for this frame: the samples up to floor((n+1) * rate * den / num).
+    size_t audio_samples = 0, audio_padded = 0, audio_bytes = 0;
+    if (cfg_.audio_channels) {
+        const size_t ch = cfg_.audio_channels;
+        uint64_t t = audio_rem_ + uint64_t(cfg_.audio_rate) * cfg_.fps_den;
+        audio_samples = size_t(t / cfg_.fps_num);
+        audio_rem_ = t % cfg_.fps_num;
+        size_t have = audio_queue_.size() / ch;
+        if (have < audio_samples) {
+            audio_padded = audio_samples - have;
+            audio_queue_.resize(audio_samples * ch, 0);
+        }
+        size_t len_pos = out.size();
+        out.resize(len_pos + 4);
+        for (size_t off = 0; off < audio_samples; off += size_t(detail::qoa::kMaxFrameLen)) {
+            int n = int(std::min(audio_samples - off, size_t(detail::qoa::kMaxFrameLen)));
+            detail::qoa::encode_frame(audio_queue_.data() + off * ch, int(ch), cfg_.audio_rate, n, audio_lms_, out);
+        }
+        audio_bytes = out.size() - len_pos - 4;
+        put_u32(out.data() + len_pos, uint32_t(audio_bytes));
+        audio_queue_.erase(audio_queue_.begin(), audio_queue_.begin() + std::ptrdiff_t(audio_samples * ch));
+    }
+
     if (stats) {
         stats->frame_num = frame_num_;
         stats->force_refresh = force;
         stats->dirty_tiles = dirty_count;
         stats->total_tiles = uint32_t(tiles);
         stats->bytes = out.size() - start;
+        stats->audio_samples = uint32_t(audio_samples);
+        stats->audio_bytes = audio_bytes;
+        stats->audio_padded = uint32_t(audio_padded);
     }
     ++frame_num_;
     ++frame_index_;
