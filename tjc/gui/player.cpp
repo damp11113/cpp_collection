@@ -1,0 +1,384 @@
+#include "player.h"
+
+#include "platform.h"
+
+#include <algorithm>
+#include <chrono>
+
+namespace gui {
+
+namespace {
+
+size_t file_read(void* user, void* dst, size_t n) { return std::fread(dst, 1, n, static_cast<FILE*>(user)); }
+
+bool seek64(FILE* f, uint64_t off) {
+#ifdef _WIN32
+    return _fseeki64(f, (long long)off, SEEK_SET) == 0;
+#else
+    return fseeko(f, off_t(off), SEEK_SET) == 0;
+#endif
+}
+
+double now_seconds() {
+    using namespace std::chrono;
+    return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
+
+}  // namespace
+
+Player::~Player() { close(); }
+
+bool Player::open(const std::string& path, std::string* err) {
+    close();
+    dfile_ = fopen_utf8(path, "rb");
+    if (!dfile_) {
+        if (err) *err = "cannot open " + path;
+        return false;
+    }
+    tjc::Status st = dec_.read_header(file_read, dfile_);
+    if (st != tjc::Status::Ok) {
+        if (err) *err = std::string("not a playable TJC stream: ") + tjc::status_string(st);
+        std::fclose(dfile_);
+        dfile_ = nullptr;
+        return false;
+    }
+    path_ = path;
+    header_ = dec_.header();
+    layout_ = dec_.layout();
+    file_size_ = file_size_utf8(path);
+    yuv_.resize(tjc::frame_size(layout_.width, layout_.height));
+
+    audio_status_.clear();
+    if (header_.audio_codec) {
+        std::string aerr;
+        if (audio_.open(header_.audio_channels, header_.audio_rate, 1.0, &aerr))
+            audio_status_ = "QOA " + std::to_string(header_.audio_rate) + " Hz, " +
+                            std::to_string(header_.audio_channels) + " ch";
+        else
+            audio_status_ = "audio muted: " + aerr;
+    } else {
+        audio_status_ = "no audio track";
+    }
+
+    stop_ = false;
+    playing_ = false;
+    seek_req_ = -1;
+    gen_ = 0;
+    eof_ = false;
+    next_frame_ = 0;
+    pending_show_ = true;
+    base_pts_ = 0;
+    wall_ = 0;
+    last_update_ = -1;
+    current_ = 0;
+    {
+        std::lock_guard<std::mutex> lk(index_mu_);
+        offsets_.clear();
+        sync_.clear();
+        sizes_.clear();
+        index_bytes_ = 0;
+        index_done_ = false;
+        index_error_.clear();
+    }
+    open_ = true;
+    index_thread_ = std::thread(&Player::index_main, this);
+    decode_thread_ = std::thread(&Player::decode_main, this);
+    return true;
+}
+
+void Player::close() {
+    if (!open_) return;
+    stop_ = true;
+    cv_.notify_all();
+    if (index_thread_.joinable()) index_thread_.join();
+    if (decode_thread_.joinable()) decode_thread_.join();
+    audio_.close();
+    if (dfile_) std::fclose(dfile_);
+    dfile_ = nullptr;
+    queue_.clear();
+    pool_.clear();
+    open_ = false;
+    playing_ = false;
+}
+
+void Player::play() {
+    if (!open_) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    // Pressing play at the end starts over.
+    if (eof_ && queue_.empty() && current_ + 1 >= frames_indexed() && index_complete()) {
+        playing_ = true;
+        audio_.set_paused(false);
+        seek_req_ = 0;
+        ++gen_;
+        pending_show_ = true;
+        base_pts_ = 0;
+        wall_ = 0;
+        cv_.notify_all();
+        return;
+    }
+    playing_ = true;
+    audio_.set_paused(false);
+}
+
+void Player::pause() {
+    playing_ = false;
+    audio_.set_paused(true);
+}
+
+void Player::seek(uint32_t frame) {
+    if (!open_) return;
+    uint32_t known = frames_indexed();
+    if (known == 0) return;
+    frame = std::min(frame, known - 1);
+    std::lock_guard<std::mutex> lk(mu_);
+    ++gen_;
+    seek_req_ = int64_t(frame);
+    pending_show_ = true;
+    base_pts_ = pts_of(frame);
+    wall_ = 0;
+    current_ = frame;
+    audio_.clear();
+    cv_.notify_all();
+}
+
+void Player::step(int delta) {
+    int64_t t = int64_t(current_) + delta;
+    seek(uint32_t(std::max<int64_t>(0, t)));
+}
+
+void Player::set_matrix(ColorMatrix m) {
+    if (matrix_.exchange(int(m)) != int(m) && open_ && !playing_) seek(current_);
+}
+
+uint32_t Player::frames_indexed() const {
+    std::lock_guard<std::mutex> lk(index_mu_);
+    return uint32_t(offsets_.size());
+}
+
+bool Player::index_complete() const {
+    std::lock_guard<std::mutex> lk(index_mu_);
+    return index_done_;
+}
+
+double Player::index_fraction() const {
+    std::lock_guard<std::mutex> lk(index_mu_);
+    if (index_done_) return 1.0;
+    return file_size_ > 0 ? double(index_bytes_) / double(file_size_) : 0.0;
+}
+
+bool Player::index_entry(uint32_t frame, uint32_t* bytes, uint32_t* sync) const {
+    std::lock_guard<std::mutex> lk(index_mu_);
+    if (frame >= offsets_.size()) return false;
+    if (bytes) *bytes = sizes_[frame];
+    if (sync) *sync = sync_[frame];
+    return true;
+}
+
+std::string Player::error() const {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!decode_error_.empty()) return decode_error_;
+    }
+    std::lock_guard<std::mutex> lk(index_mu_);
+    return index_error_;
+}
+
+void Player::index_main() {
+    FILE* f = fopen_utf8(path_, "rb");
+    tjc::Decoder dec;
+    if (!f || dec.read_header(file_read, f) != tjc::Status::Ok) {
+        std::lock_guard<std::mutex> lk(index_mu_);
+        index_error_ = "cannot index the stream";
+        index_done_ = true;
+        if (f) std::fclose(f);
+        return;
+    }
+    const size_t tiles = size_t(layout_.tiles);
+    uint64_t off = header_.version == 1 ? tjc::kStreamHeaderSizeV1 : tjc::kStreamHeaderSize;
+    // last[t] = frame tile t was last sent in; count[f] = tiles whose last send is
+    // frame f. The smallest f with count[f] > 0 is the sync point. It only moves
+    // forward, so keeping it costs O(dirty tiles) per frame.
+    std::vector<uint32_t> last(tiles, 0);
+    std::vector<uint32_t> count(1, uint32_t(tiles));
+    uint32_t min_frame = 0;
+    for (uint32_t frame = 0; !stop_; ++frame) {
+        tjc::FrameStats fs;
+        tjc::Status st = dec.decode_frame(file_read, f, &fs, false);
+        if (st == tjc::Status::EndOfStream) break;
+        if (st != tjc::Status::Ok) {
+            std::lock_guard<std::mutex> lk(index_mu_);
+            index_error_ = std::string("stream damaged after frame ") + std::to_string(frame) + ": " +
+                           tjc::status_string(st);
+            break;
+        }
+        if (count.size() < size_t(frame) + 1) count.resize(size_t(frame) + 1, 0);
+        const uint8_t* dirty = dec.dirty_flags();
+        for (size_t t = 0; t < tiles; ++t) {
+            if (!dirty[t]) continue;
+            --count[last[t]];
+            last[t] = frame;
+            ++count[frame];
+        }
+        while (count[min_frame] == 0) ++min_frame;
+        {
+            std::lock_guard<std::mutex> lk(index_mu_);
+            offsets_.push_back(off);
+            sync_.push_back(min_frame);
+            sizes_.push_back(uint32_t(fs.bytes));
+            index_bytes_ = off + fs.bytes;
+        }
+        off += fs.bytes;
+    }
+    std::fclose(f);
+    std::lock_guard<std::mutex> lk(index_mu_);
+    index_done_ = true;
+}
+
+void Player::recycle(VideoFrame&& f) {
+    if (pool_.size() < kQueue + 2) pool_.push_back(std::move(f));
+}
+
+bool Player::decode_one() {
+    VideoFrame f;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!pool_.empty()) {
+            f = std::move(pool_.back());
+            pool_.pop_back();
+        }
+    }
+    uint64_t gen = gen_.load();
+    tjc::Status st = dec_.decode_frame(file_read, dfile_, &f.stats, true);
+    if (st != tjc::Status::Ok) {
+        std::lock_guard<std::mutex> lk(mu_);
+        eof_ = true;
+        if (st != tjc::Status::EndOfStream)
+            decode_error_ = std::string("frame ") + std::to_string(next_frame_) + ": " + tjc::status_string(st);
+        return false;
+    }
+    f.index = next_frame_++;
+    f.pts = pts_of(f.index);
+    f.generation = gen;
+    dec_.copy_frame(yuv_.data());
+    f.rgba.resize(size_t(layout_.width) * size_t(layout_.height) * 4);
+    yuv420_to_rgba(yuv_.data(), layout_.width, layout_.height, ColorMatrix(matrix_.load()), f.rgba.data());
+    f.dirty.assign(dec_.dirty_flags(), dec_.dirty_flags() + layout_.tiles);
+
+    if (audio_.is_open() && dec_.audio_samples()) {
+        const int16_t* a = dec_.audio();
+        size_t left = dec_.audio_samples();
+        while (left && !stop_ && seek_req_.load() < 0) {
+            size_t n = audio_.write(a, left);
+            a += n * size_t(header_.audio_channels);
+            left -= n;
+            if (left) std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        }
+        if (left) return false;  // interrupted by a seek or close
+    }
+    std::lock_guard<std::mutex> lk(mu_);
+    if (gen != gen_.load()) {
+        recycle(std::move(f));
+        return false;
+    }
+    queue_.push_back(std::move(f));
+    return true;
+}
+
+void Player::do_seek(uint32_t target, uint64_t gen) {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        while (!queue_.empty()) {
+            recycle(std::move(queue_.front()));
+            queue_.pop_front();
+        }
+        eof_ = false;
+        decode_error_.clear();
+    }
+    audio_.clear();
+    uint64_t off;
+    uint32_t start;
+    {
+        std::lock_guard<std::mutex> lk(index_mu_);
+        if (offsets_.empty()) return;
+        target = std::min<uint32_t>(target, uint32_t(offsets_.size() - 1));
+        start = sync_[target];
+        off = offsets_[start];
+    }
+    if (!seek64(dfile_, off)) return;
+    // Bring every tile up to date; only the target frame is shown.
+    for (uint32_t f = start; f < target; ++f) {
+        if (stop_ || gen != gen_.load()) return;
+        if (dec_.decode_frame(file_read, dfile_, nullptr, true) != tjc::Status::Ok) break;
+    }
+    next_frame_ = target;
+    audio_.clear();
+}
+
+void Player::decode_main() {
+    while (!stop_) {
+        int64_t req = seek_req_.exchange(-1);
+        if (req >= 0) {
+            do_seek(uint32_t(req), gen_.load());
+            continue;
+        }
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            cv_.wait_for(lk, std::chrono::milliseconds(20), [&] {
+                return stop_ || seek_req_.load() >= 0 || (!eof_ && queue_.size() < kQueue);
+            });
+            if (stop_ || seek_req_.load() >= 0 || eof_ || queue_.size() >= kQueue) continue;
+        }
+        decode_one();
+    }
+}
+
+bool Player::update(VideoFrame& out) {
+    if (!open_) return false;
+    double now = now_seconds();
+    double dt = last_update_ < 0 ? 0 : now - last_update_;
+    last_update_ = now;
+
+    std::unique_lock<std::mutex> lk(mu_);
+    uint64_t gen = gen_.load();
+    while (!queue_.empty() && queue_.front().generation != gen) {
+        recycle(std::move(queue_.front()));
+        queue_.pop_front();
+    }
+
+    bool got = false;
+    auto take_front = [&] {
+        std::swap(out, queue_.front());
+        recycle(std::move(queue_.front()));
+        queue_.pop_front();
+        current_ = out.index;
+        got = true;
+    };
+
+    if (pending_show_) {
+        // First frame after open or a seek: show it right away, then run the clock from it.
+        if (!queue_.empty()) {
+            take_front();
+            pending_show_ = false;
+            base_pts_ = out.pts;
+            wall_ = 0;
+        }
+    } else if (playing_) {
+        if (!audio_.is_open()) wall_ += dt;
+        double clock = base_pts_ + (audio_.is_open() ? double(audio_.played()) / audio_.rate() : wall_);
+        while (!queue_.empty() && queue_.front().pts <= clock) take_front();
+        bool drained = !audio_.is_open() || audio_.buffered_frames() == 0;
+        if (queue_.empty() && eof_ && drained) {
+            if (loop_ && frames_indexed() > 1) {
+                lk.unlock();
+                seek(0);
+                return got;
+            }
+            playing_ = false;
+            audio_.set_paused(true);
+        }
+    }
+    cv_.notify_all();
+    return got;
+}
+
+}  // namespace gui

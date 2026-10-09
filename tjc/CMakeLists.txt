@@ -15,3 +15,8 @@ target_link_libraries(tjc_test PRIVATE Threads::Threads)
 
 enable_testing()
 add_test(NAME tjc_test COMMAND tjc_test)
+
+option(TJC_BUILD_STUDIO "Also build the TJC Studio GUI (downloads GLFW, Dear ImGui, miniaudio)" OFF)
+if(TJC_BUILD_STUDIO)
+    add_subdirectory(gui)
+endif()

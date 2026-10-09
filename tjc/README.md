@@ -11,7 +11,8 @@ and video stay in sync by construction.
 |---------------|-------------------------------------------------------------------|
 | `tjc.h`       | single-header library: encoder + decoder (stb-style)              |
 | `tjc.cpp`     | `tjc` command line tool: `encode`, `decode`, `info`               |
-| `tjc_test.cpp`| unit tests (bitstream, DCT, Huffman, bitmap, SAD, refresh, QOA) + end-to-end |
+| `tjc_test.cpp`| unit tests (bitstream, DCT, Huffman, bitmap, SAD, refresh, QOA, seeking) + end-to-end |
+| `gui/`        | **TJC Studio**: desktop player + encoder for Windows and Linux/X11 |
 
 ## Build
 
@@ -25,7 +26,69 @@ or `cmake -B build && cmake --build build && ./build/tjc_test`.
 Optional: `ln -s tjc tjc_encode && ln -s tjc tjc_decode` lets you call the tool
 without the subcommand.
 
-## Windows
+## TJC Studio (GUI)
+
+A desktop app for playing and encoding TJC streams. One codebase for Windows and
+Linux/X11, built with GLFW, Dear ImGui (OpenGL 2) and miniaudio. CMake downloads
+all three when you configure the build.
+
+**Player tab**
+- Plays video and audio in sync, timed by the audio clock (or the wall clock when
+  there is no audio or no sound device).
+- Exact seeking: slider, Left/Right = 5 s, `,` `.` = one frame, Home = start.
+  An index pass computes for each frame the oldest frame whose tiles are still on
+  screen. Seeking decodes from there, so the picture is bit-identical to playing
+  from the start without decoding the whole file. That's one refresh cycle for
+  rolling streams, back to the last full refresh for periodic ones.
+- Tile overlay (`T`): red = tiles this frame updated, blue = full refresh.
+- Info panel: stream settings, per-frame tiles/bytes/audio, the frame each seek
+  restarts from, and a frame-size graph.
+- Loop, volume, BT.601/BT.709 color matrix, click the picture to play/pause.
+
+**Encoder tab**
+- Input: any file ffmpeg can read. ffprobe fills in size, frame rate and audio.
+- Output size presets (source/1080p/720p/480p/360p/custom), frame rate, tile size,
+  quality, motion threshold, refresh mode, keyframes, threads, audio on/off with
+  resampling (rate, stereo/mono).
+- Progress, speed, ETA, bitrate, a live preview of what the decoder will show,
+  Cancel (deletes the partial file), and "Play output".
+- Produces the same bytes as `tjc encode` with the same settings.
+
+Drop a `.tjc` on the window to play it, or any video to encode it. A file given on
+the command line works the same way (`tjc_studio clip.tjc`).
+
+ffmpeg/ffprobe must be in PATH, or set their folder under "ffmpeg location" in the
+Encoder tab. The player doesn't need them.
+
+### Build on Windows
+
+```bat
+:: Visual Studio (Developer Command Prompt) or MinGW; needs CMake 3.16+
+cmake -S gui -B build-studio
+cmake --build build-studio --config Release
+:: -> build-studio\Release\tjc_studio.exe (VS) or build-studio\tjc_studio.exe (MinGW)
+```
+
+It's a normal GUI app with no console window. A MinGW build links its runtime
+statically, so the `.exe` needs only system DLLs.
+
+### Build on Linux (X11)
+
+```bash
+sudo apt install build-essential cmake libx11-dev libxrandr-dev libxinerama-dev \
+                 libxcursor-dev libxi-dev libgl1-mesa-dev
+cmake -S gui -B build-studio && cmake --build build-studio -j
+./build-studio/tjc_studio
+```
+
+It also runs on Wayland desktops through XWayland. Sound goes through
+PulseAudio/PipeWire/ALSA, picked at runtime.
+
+Or build everything at once: `cmake -B build -DTJC_BUILD_STUDIO=ON`. Offline builds
+can point `FETCHCONTENT_SOURCE_DIR_GLFW`, `..._IMGUI` and `..._MINIAUDIO` at local
+copies of GLFW 3.4, Dear ImGui 1.91.9b and miniaudio 0.11.22.
+
+## Windows (command line tool)
 
 Build with any of these (output: `tjc.exe`):
 

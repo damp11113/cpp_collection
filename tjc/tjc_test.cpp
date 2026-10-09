@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <set>
 #include <vector>
 
@@ -665,6 +666,103 @@ static void test_tjc1_compat() {
     CHECK(frames == 5 && same);
 }
 
+// Exact seeking as TJC Studio does it: a parse-only pass (apply = false) records
+// per frame the oldest "last sent" frame over all tiles; decoding from there
+// must reproduce frame T exactly.
+static void test_seek_sync(RefreshMode mode, uint32_t param, uint32_t keyframe_every, int tile) {
+    Config cfg;
+    cfg.width = 96;
+    cfg.height = 64;
+    cfg.tile_w = cfg.tile_h = uint8_t(tile);
+    cfg.refresh_mode = mode;
+    cfg.refresh_param = param;
+    cfg.audio_channels = 1;
+    cfg.audio_rate = 8000;
+    Encoder enc;
+    CHECK(enc.init(cfg));
+    std::vector<uint8_t> stream, f;
+    std::vector<int16_t> pcm;
+    enc.write_stream_header(stream);
+    const int frames = 60;
+    for (int t = 0; t < frames; ++t) {
+        if (keyframe_every && t && t % int(keyframe_every) == 0) enc.force_keyframe();
+        make_frame(f, 96, 64, t);
+        make_audio(pcm, 0, enc.samples_for_next_frame(), 1, 8000);
+        enc.push_audio(pcm.data(), pcm.size());
+        enc.encode_frame(f.data(), stream);
+    }
+
+    // Reference: every frame decoded from the start.
+    std::vector<std::vector<uint8_t>> ref;
+    std::vector<FrameStats> ref_stats;
+    {
+        MemoryReader mr{stream.data(), stream.size(), 0};
+        Decoder d;
+        CHECK(d.read_header(MemoryReader::read, &mr) == Status::Ok);
+        FrameStats st;
+        while (d.decode_frame(MemoryReader::read, &mr, &st) == Status::Ok) {
+            ref.emplace_back(frame_size(96, 64));
+            d.copy_frame(ref.back().data());
+            ref_stats.push_back(st);
+        }
+    }
+    CHECK(int(ref.size()) == frames);
+
+    // Index pass without decoding.
+    std::vector<size_t> offsets;
+    std::vector<uint32_t> sync;
+    {
+        MemoryReader mr{stream.data(), stream.size(), 0};
+        Decoder d;
+        CHECK(d.read_header(MemoryReader::read, &mr) == Status::Ok);
+        const size_t tiles = size_t(d.layout().tiles);
+        std::vector<uint32_t> last(tiles, 0);
+        std::vector<uint8_t> before(frame_size(96, 64)), after(before.size());
+        d.copy_frame(before.data());
+        FrameStats st;
+        bool stats_match = true;
+        for (uint32_t t = 0;; ++t) {
+            size_t off = mr.pos;
+            if (d.decode_frame(MemoryReader::read, &mr, &st, false) != Status::Ok) break;
+            stats_match &= st.bytes == ref_stats[t].bytes && st.dirty_tiles == ref_stats[t].dirty_tiles &&
+                           st.audio_bytes == ref_stats[t].audio_bytes && d.audio_samples() == 0;
+            for (size_t i = 0; i < tiles; ++i)
+                if (d.dirty_flags()[i]) last[i] = t;
+            offsets.push_back(off);
+            sync.push_back(*std::min_element(last.begin(), last.end()));
+        }
+        d.copy_frame(after.data());
+        CHECK(stats_match);
+        CHECK(before == after);  // apply = false leaves the picture alone
+    }
+
+    bool exact = true;
+    uint64_t decoded = 0;
+    for (int t = 0; t < frames; ++t) {
+        MemoryReader mr{stream.data(), stream.size(), 0};
+        Decoder d;
+        d.read_header(MemoryReader::read, &mr);
+        mr.pos = offsets[size_t(sync[size_t(t)])];
+        for (int k = int(sync[size_t(t)]); k <= t; ++k, ++decoded) d.decode_frame(MemoryReader::read, &mr);
+        std::vector<uint8_t> out(frame_size(96, 64));
+        d.copy_frame(out.data());
+        exact &= out == ref[size_t(t)];
+    }
+    CHECK(exact);
+    std::printf("  %-8s param %-3u keyframe %-3u tile %-2d: avg %.1f frames decoded per seek\n",
+                mode == RefreshMode::None ? "none" : mode == RefreshMode::Rolling ? "rolling" : "periodic", param,
+                keyframe_every, tile, double(decoded) / frames);
+}
+
+static void test_seeking() {
+    std::printf("exact seeking from sync points\n");
+    test_seek_sync(RefreshMode::Rolling, 4, 0, 16);
+    test_seek_sync(RefreshMode::Rolling, 1, 0, 8);
+    test_seek_sync(RefreshMode::FullPeriodic, 10, 0, 16);
+    test_seek_sync(RefreshMode::None, 0, 0, 16);
+    test_seek_sync(RefreshMode::None, 0, 15, 7);
+}
+
 static void test_corrupt_input() {
     std::printf("corrupt / truncated input\n");
     Config cfg;
@@ -728,6 +826,7 @@ int main() {
     test_audio_video();
     test_sync_drift();
     test_tjc1_compat();
+    test_seeking();
     test_corrupt_input();
     std::printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;

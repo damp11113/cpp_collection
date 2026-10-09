@@ -395,7 +395,12 @@ public:
     Status read_header(ReadFn fn, void* user);
 
     // Reads and applies one frame record. Returns EndOfStream at clean EOF.
-    Status decode_frame(ReadFn fn, void* user, FrameStats* stats = nullptr);
+    // With apply = false the record is only parsed (for indexing a stream): the
+    // framebuffer and audio are left alone, stats and dirty_flags() still update.
+    Status decode_frame(ReadFn fn, void* user, FrameStats* stats = nullptr, bool apply = true);
+
+    // Which tiles the last frame carried (layout().tiles entries, 1 = sent).
+    const uint8_t* dirty_flags() const { return dirty_.data(); }
 
     const StreamHeader& header() const { return header_; }
     const Layout& layout() const { return layout_; }
@@ -414,7 +419,7 @@ public:
 
 private:
     bool decode_tile(const uint8_t* data, size_t size, int tile);
-    Status decode_audio(ReadFn fn, void* user, size_t* bytes);
+    Status decode_audio(ReadFn fn, void* user, size_t* bytes, bool apply);
 
     StreamHeader header_;
     Layout layout_;
@@ -1452,7 +1457,7 @@ Status Decoder::read_header(ReadFn fn, void* user) {
     return Status::Ok;
 }
 
-Status Decoder::decode_audio(ReadFn fn, void* user, size_t* bytes) {
+Status Decoder::decode_audio(ReadFn fn, void* user, size_t* bytes, bool apply) {
     audio_samples_ = 0;
     uint8_t lb[4];
     if (read_full(fn, user, lb, 4) < 4) return Status::Truncated;
@@ -1473,6 +1478,7 @@ Status Decoder::decode_audio(ReadFn fn, void* user, size_t* bytes) {
         }
     }
     if (read_full(fn, user, payload_.data(), len) < len) return Status::Truncated;
+    if (!apply) return Status::Ok;
     size_t pos = 0;
     while (pos < len) {
         if (audio_samples_ + detail::qoa::kMaxFrameLen > max_samples) return Status::Corrupt;
@@ -1524,7 +1530,7 @@ bool Decoder::decode_tile(const uint8_t* data, size_t size, int tile) {
     return !br.overrun();
 }
 
-Status Decoder::decode_frame(ReadFn fn, void* user, FrameStats* stats) {
+Status Decoder::decode_frame(ReadFn fn, void* user, FrameStats* stats, bool apply) {
     if (!ready_) return Status::NotInitialized;
     uint8_t hdr[kFrameHeaderSize];
     size_t n = read_full(fn, user, hdr, sizeof(hdr));
@@ -1558,14 +1564,14 @@ Status Decoder::decode_frame(ReadFn fn, void* user, FrameStats* stats) {
             }
         }
         if (read_full(fn, user, payload_.data(), len) < len) return Status::Truncated;
-        if (!decode_tile(payload_.data(), len, t)) return Status::Corrupt;
+        if (apply && !decode_tile(payload_.data(), len, t)) return Status::Corrupt;
         bytes += 2 + len;
         ++dirty_count;
     }
 
     size_t video_bytes = bytes;
     if (header_.audio_codec) {
-        Status st = decode_audio(fn, user, &bytes);
+        Status st = decode_audio(fn, user, &bytes, apply);
         if (st != Status::Ok) return st;
     }
 
