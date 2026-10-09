@@ -141,12 +141,80 @@ off dropped from 3476 to 93, and the file got 4% smaller. Real video costs about
 nothing extra. This is an encoder change only: re-encoded TJC2/TJC3 files play on the
 old decoders.
 
+## How TJC compares with older codecs
+
+These are rate-distortion sweeps on six 60-frame clips: camera pan, noisy camera,
+zoom, screen content, motion graphics and noisy pan. All codecs run single-threaded.
+The older codecs get their better ffmpeg options: RD macroblock decisions,
+trellis, 4 vectors per macroblock, no B-frames and a keyframe every 4 s. H.264 runs
+`-tune psnr`. H.261 and baseline H.263 only take CIF-family sizes, so they are
+measured on a CIF version of the same clips. The scripts are in `bench/`, so you
+can run your own clip:
+
+```bash
+ffmpeg -i test.mp4 -t 4 -f rawvideo -pix_fmt yuv420p clip.yuv
+TJC=./tjc bench/compare_codecs.sh clip.yuv 1280 720 120 30 > results.txt
+python3 bench/bd_rate.py results.txt --ref h263p
+```
+
+BD-rate (PSNR-Y), the average bitrate difference at equal quality. Negative means
+fewer bits:
+
+| Codec (year) | 720p vs MJPEG | 720p vs H.263+ | CIF vs MJPEG | CIF vs H.263 |
+|---|---|---|---|---|
+| MJPEG (1992) | 0% | +509% | 0% | +559% |
+| H.261 (1990) | — | — | -68% | +56% |
+| H.263 (1996) | — | — | -80% | 0% |
+| H.263+ (1998) | -72% | 0% | — | — |
+| MPEG-1 (1993) | -72% | -1% | — | — |
+| MPEG-2 (1995) | -71% | +6% | — | — |
+| MPEG-4 Part 2 (1999) | -73% | -4% | — | — |
+| H.264 / x264 (2003, reference) | -87% | -60% | -94% | -67% |
+| TJC2 | +5% | +447% | -27% | +263% |
+| TJC3 | -45% | +115% | -60% | +101% |
+| **TJC4 `--quadtree`** | **-55%** | **+61%** | **-63%** | **+78%** |
+
+Per clip, TJC4 against H.263+ at 720p: screen content +5%, motion graphics +1%,
+zoom +60%, camera pan +49%, noisy camera +77%, noisy pan +173%. At high quality
+(above ~43 dB) TJC4 overtakes H.263+/MPEG-4 on the noisy clips and zoom, where the
+older codecs' curves flatten. At CIF, TJC4 ends up between H.261 and H.263: 26%
+behind H.261 on average, 10% ahead of it on zoom.
+
+What this means:
+
+- **TJC beats MJPEG by a mile** (TJC3/TJC4 need about half the bits), with a
+  decoder about as simple.
+- **TJC is not yet an H.263 killer.** At low and medium bitrates on camera video,
+  1990s inter codecs still need 30-60% fewer bits. It catches up on screen content
+  and motion graphics, and at high quality.
+- Where the bits go, measured on the camera pan:
+  - The per-tile 2-byte length, byte padding and dirty bitmap are roughly a
+    quarter of the stream when most tiles change.
+  - About 12% goes to motion-compensated residual blocks that are all zero. H.263
+    marks those with one coded-block-pattern code per macroblock.
+  - The JPEG perceptual quant tables also cost PSNR against the flat matrices of
+    H.263/MPEG. That is a measurement artifact as much as a real loss.
+- **Decode speed** (x86, single thread, 720p at 38 dB): TJC3/TJC4 decode motion
+  graphics at 780-920 fps, faster than ffmpeg's SIMD-optimized MPEG-1/2/4 and H.263+
+  decoders (550-630 fps). The camera pan decodes at about 300 fps against 500-600,
+  and the noisy camera at about 130 fps against 340-375. There TJC also unpacks 2-3x
+  as many bits for the same quality. TJC's decoder is plain portable C++ with no
+  SIMD, which is the relevant case for the MIPS target.
+- TJC's design advantages are elsewhere:
+  - Partial-screen updates with no macroblock overhead for static areas.
+  - Exact seeking without keyframes.
+  - Per-tile error isolation.
+  - Integer-exact output on every platform.
+  - Built-in synchronized audio.
+  - A 24 KB decoder.
+
 | File          | What                                                              |
 |---------------|-------------------------------------------------------------------|
 | `tjc.h`       | single-header library: encoder + decoder (stb-style)              |
 | `tjc.cpp`     | `tjc` command line tool: `encode`, `decode`, `info`               |
 | `tjc_test.cpp`| unit tests (DCT, Huffman, motion, seeking, QOA, fuzzing, ...) + end-to-end |
 | `gui/`        | **TJC Studio**: desktop player + encoder for Windows and Linux/X11 |
+| `bench/`      | rate-distortion comparison against MJPEG/H.261/H.263/MPEG-1/2/4/H.264 |
 
 ## Build
 
