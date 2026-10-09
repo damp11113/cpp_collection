@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 
 namespace gui {
 
@@ -45,6 +46,7 @@ bool Player::open(const std::string& path, std::string* err) {
     path_ = path;
     header_ = dec_.header();
     layout_ = dec_.layout();
+    units_ = dec_.unit_layout();
     file_size_ = file_size_utf8(path);
     yuv_.resize(tjc::frame_size(layout_.width, layout_.height));
 
@@ -77,6 +79,9 @@ bool Player::open(const std::string& path, std::string* err) {
         sync_.clear();
         tables_.clear();
         sizes_.clear();
+        qualities_.clear();
+        cum_.assign(1, 0);
+        peak_kbps_ = 0;
         index_bytes_ = 0;
         index_done_ = false;
         index_error_.clear();
@@ -167,12 +172,26 @@ double Player::index_fraction() const {
     return file_size_ > 0 ? double(index_bytes_) / double(file_size_) : 0.0;
 }
 
-bool Player::index_entry(uint32_t frame, uint32_t* bytes, uint32_t* sync) const {
+bool Player::index_entry(uint32_t frame, uint32_t* bytes, uint32_t* sync, uint8_t* quality) const {
     std::lock_guard<std::mutex> lk(index_mu_);
     if (frame >= offsets_.size()) return false;
     if (bytes) *bytes = sizes_[frame];
     if (sync) *sync = sync_[frame];
+    if (quality) *quality = qualities_[frame];
     return true;
+}
+
+double Player::bitrate_kbps(uint32_t frame, uint32_t window) const {
+    std::lock_guard<std::mutex> lk(index_mu_);
+    if (frame >= offsets_.size() || window == 0) return 0;
+    uint32_t first = frame + 1 >= window ? frame + 1 - window : 0;
+    double secs = double(frame + 1 - first) * header_.fps_den / header_.fps_num;
+    return double(cum_[frame + 1] - cum_[first]) * 8.0 / secs / 1000.0;
+}
+
+double Player::peak_kbps() const {
+    std::lock_guard<std::mutex> lk(index_mu_);
+    return peak_kbps_;
 }
 
 std::string Player::error() const {
@@ -198,8 +217,9 @@ void Player::index_main() {
     // The tracker follows what each tile's content depends on (motion vectors
     // included) and gives the frame a seek has to start decoding from.
     tjc::SyncTracker tracker;
-    tracker.reset(layout_);
+    tracker.reset(dec.unit_layout());
     int64_t last_tables = -1;
+    const uint32_t second = uint32_t(std::max(1.0, std::round(double(header_.fps_num) / header_.fps_den)));
     for (uint32_t frame = 0; !stop_; ++frame) {
         tjc::FrameStats fs;
         tjc::Status st = dec.decode_frame(file_read, f, &fs, false);
@@ -210,7 +230,7 @@ void Player::index_main() {
                            tjc::status_string(st);
             break;
         }
-        uint32_t sync = tracker.add_frame(frame, dec.tile_info());
+        uint32_t sync = tracker.add_frame(frame, dec.unit_info());
         if (fs.tables) last_tables = frame;
         {
             std::lock_guard<std::mutex> lk(index_mu_);
@@ -218,6 +238,11 @@ void Player::index_main() {
             sync_.push_back(sync);
             tables_.push_back(int32_t(last_tables));
             sizes_.push_back(uint32_t(fs.bytes));
+            qualities_.push_back(fs.quality);
+            cum_.push_back(cum_.back() + fs.bytes);
+            if (frame + 1 >= second)  // busiest full one-second window
+                peak_kbps_ = std::max(peak_kbps_, double(cum_[frame + 1] - cum_[frame + 1 - second]) * 8.0 /
+                                                      (double(second) * header_.fps_den / header_.fps_num) / 1000.0);
             index_bytes_ = off + fs.bytes;
         }
         off += fs.bytes;
@@ -225,6 +250,8 @@ void Player::index_main() {
     std::fclose(f);
     std::lock_guard<std::mutex> lk(index_mu_);
     index_done_ = true;
+    if (peak_kbps_ == 0 && !offsets_.empty())  // shorter than a second: the average
+        peak_kbps_ = double(cum_.back()) * 8.0 / (double(offsets_.size()) * header_.fps_den / header_.fps_num) / 1000.0;
 }
 
 void Player::recycle(VideoFrame&& f) {
@@ -255,10 +282,10 @@ bool Player::decode_one() {
     dec_.copy_frame(yuv_.data());
     f.rgba.resize(size_t(layout_.width) * size_t(layout_.height) * 4);
     yuv420_to_rgba(yuv_.data(), layout_.width, layout_.height, ColorMatrix(matrix_.load()), f.rgba.data());
-    // Per tile: 0 = unchanged, 1 = intra, 2 = motion compensated, 3 = full refresh.
-    f.dirty.resize(size_t(layout_.tiles));
-    const tjc::TileInfo* info = dec_.tile_info();
-    for (int t = 0; t < layout_.tiles; ++t)
+    // Per unit: 0 = unchanged, 1 = intra, 2 = motion compensated, 3 = full refresh.
+    f.dirty.resize(size_t(units_.tiles));
+    const tjc::TileInfo* info = dec_.unit_info();
+    for (int t = 0; t < units_.tiles; ++t)
         f.dirty[size_t(t)] = f.stats.force_refresh && info[t].mode ? 3 : info[t].mode;
 
     if (audio_.is_open() && dec_.audio_samples()) {
@@ -310,6 +337,8 @@ void Player::do_seek(uint32_t target, uint64_t gen) {
     if (need_tables) {
         if (!seek64(dfile_, tables_off)) return;
         dec_.decode_frame(file_read, dfile_, nullptr, false);
+    } else {
+        dec_.reset_tables();  // the start frame still uses the standard tables
     }
     if (!seek64(dfile_, off)) return;
     // Bring every tile up to date; only the target frame is shown.

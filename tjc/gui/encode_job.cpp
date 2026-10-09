@@ -3,7 +3,9 @@
 #include "platform.h"
 #include "yuv.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <map>
 #include <sstream>
@@ -213,7 +215,10 @@ void EncodeJob::run() {
     auto last_preview = clock::now() - std::chrono::seconds(1);
     set_message("encoding");
 
-    uint64_t frames = 0;
+    uint64_t frames = 0, deferred = 0;
+    const double fps = double(cfg.fps_num) / cfg.fps_den;
+    std::vector<uint64_t> window(size_t(std::max(1.0, std::round(fps))), 0);
+    uint64_t window_sum = 0;
     while (write_ok && !cancel_) {
         if (video.read_full(frame.data(), frame.size()) < frame.size()) break;
         if (cfg.audio_channels && !audio_eof) {
@@ -242,6 +247,10 @@ void EncodeJob::run() {
         inter += st.inter_tiles;
         tiles += st.total_tiles;
         padded += st.audio_padded;
+        deferred += st.deferred_tiles;
+        window_sum -= window[frames % window.size()];
+        window[frames % window.size()] = buf.size();
+        window_sum += buf.size();
 
         auto now = clock::now();
         bool want_preview = now - last_preview > std::chrono::milliseconds(250);
@@ -260,6 +269,9 @@ void EncodeJob::run() {
         p_.dirty_percent = tiles ? 100.0 * double(dirty) / double(tiles) : 0;
         p_.inter_percent = dirty ? 100.0 * double(inter) / double(dirty) : 0;
         p_.audio_padded = padded;
+        p_.recent_kbps = double(window_sum) * 8.0 / (double(std::min<uint64_t>(frames, window.size())) / fps) / 1000.0;
+        p_.last_quality = st.quality;
+        p_.deferred = deferred;
         p_.elapsed = std::chrono::duration<double>(now - t0).count();
         if (want_preview) {
             preview_.swap(rgba);

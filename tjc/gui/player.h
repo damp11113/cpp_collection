@@ -26,7 +26,7 @@ struct VideoFrame {
     double pts = 0;
     uint64_t generation = 0;
     std::vector<uint8_t> rgba;   // width * height * 4
-    std::vector<uint8_t> dirty;  // per tile: 0 unchanged, 1 intra, 2 motion, 3 full refresh
+    std::vector<uint8_t> dirty;  // per unit (Player::unit_layout()): 0 unchanged, 1 intra, 2 motion, 3 full refresh
     tjc::FrameStats stats;
 };
 
@@ -43,6 +43,8 @@ public:
     const std::string& path() const { return path_; }
     const tjc::StreamHeader& header() const { return header_; }
     const tjc::Layout& layout() const { return layout_; }
+    // Grid of the smallest coded areas: quadtree leaves (TJC4) or the tiles.
+    const tjc::Layout& unit_layout() const { return units_; }
     double fps() const { return double(header_.fps_num) / double(header_.fps_den); }
     double pts_of(uint32_t frame) const { return double(frame) * header_.fps_den / header_.fps_num; }
 
@@ -63,7 +65,11 @@ public:
     uint32_t frames_indexed() const;
     bool index_complete() const;
     double index_fraction() const;
-    bool index_entry(uint32_t frame, uint32_t* bytes, uint32_t* sync) const;
+    bool index_entry(uint32_t frame, uint32_t* bytes, uint32_t* sync, uint8_t* quality = nullptr) const;
+    // Bitrate over the `window` frames ending at `frame` (kbit/s); 0 if not indexed yet.
+    double bitrate_kbps(uint32_t frame, uint32_t window) const;
+    // Highest one-second bitrate seen by the indexer so far.
+    double peak_kbps() const;
     bool seeking() const { return pending_show_; }
     bool has_audio() const { return audio_.is_open(); }
     const std::string& audio_status() const { return audio_status_; }
@@ -81,7 +87,7 @@ private:
     std::string path_;
     bool open_ = false;
     tjc::StreamHeader header_;
-    tjc::Layout layout_;
+    tjc::Layout layout_, units_;
     int64_t file_size_ = 0;
 
     // Decode thread state.
@@ -96,6 +102,9 @@ private:
     std::vector<uint64_t> offsets_;
     std::vector<uint32_t> sync_, sizes_;
     std::vector<int32_t> tables_;  // last frame <= f that carried Huffman tables (-1: none)
+    std::vector<uint8_t> qualities_;
+    std::vector<uint64_t> cum_;    // cum_[f] = bytes of frames < f
+    double peak_kbps_ = 0;
     uint64_t index_bytes_ = 0;
     bool index_done_ = false;
     std::string index_error_;

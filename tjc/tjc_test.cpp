@@ -354,6 +354,48 @@ static void test_header() {
     CHECK(r.version == 1 && r.fps_num == 30 && r.fps_den == 1 && r.audio_codec == 0);
     CHECK(validate_geometry(64, 64, 128, 128) != nullptr);  // payload could overflow tile_len
     CHECK(validate_geometry(64, 64, 112, 112) == nullptr);
+
+    // TJC4: split levels, bigger tiles (varint lengths).
+    {
+        StreamHeader h4 = h;
+        h4.version = 4;
+        h4.tile_w = h4.tile_h = 64;
+        h4.split_levels = 3;
+        h4.flags = kFlagMotion;
+        uint8_t b4[kStreamHeaderSize];
+        write_stream_header(h4, b4);
+        StreamHeader r4;
+        CHECK(std::memcmp(b4, "TJC4", 4) == 0);
+        CHECK(parse_stream_header(b4, kStreamHeaderSize, &r4) == Status::Ok);
+        CHECK(r4.version == 4 && r4.split_levels == 3 && r4.tile_w == 64 && r4.flags == kFlagMotion);
+        b4[33] = 4;  // 64 >> 4 = 4: leaf below 8
+        CHECK(parse_stream_header(b4, kStreamHeaderSize, &r4) == Status::BadHeader);
+        b4[33] = 0;
+        b4[8] = b4[9] = 200;  // big fixed tiles are fine in TJC4
+        CHECK(parse_stream_header(b4, kStreamHeaderSize, &r4) == Status::Ok);
+    }
+    CHECK(validate_geometry_v4(640, 360, 64, 64, 3) == nullptr);
+    CHECK(validate_geometry_v4(640, 360, 128, 128, 4) == nullptr);
+    CHECK(validate_geometry_v4(640, 360, 48, 48, 1) == nullptr);   // leaf 24
+    CHECK(validate_geometry_v4(640, 360, 48, 48, 3) != nullptr);   // leaf 6
+    CHECK(validate_geometry_v4(640, 360, 64, 32, 1) != nullptr);   // not square
+    CHECK(validate_geometry_v4(640, 360, 255, 255, 0) == nullptr);
+    CHECK(validate_geometry_v4(640, 360, 40, 40, 2) == nullptr);   // leaf 10
+    CHECK(validate_geometry_v4(640, 360, 36, 36, 2) != nullptr);   // leaf 9 is odd
+    Layout ul = unit_layout(make_layout(100, 50, 32, 32), 2);
+    CHECK(ul.tile_w == 8 && ul.cols == 16 && ul.rows == 8);
+
+    // Varint tile lengths.
+    bool ok = true;
+    for (uint32_t v : {1u, 127u, 128u, 16383u, 16384u, 70000u, uint32_t(kMaxTilePayloadV4)}) {
+        std::vector<uint8_t> b;
+        detail::put_varint(b, v);
+        ok &= int(b.size()) == detail::varint_size(v) && b.size() <= 3;
+        uint32_t got = 0;
+        for (size_t i = 0; i < b.size(); ++i) got |= uint32_t(b[i] & 0x7f) << (7 * i);
+        ok &= got == v && !(b.back() & 0x80);
+    }
+    CHECK(ok);
 }
 
 // Synthetic moving test pattern.
@@ -686,11 +728,14 @@ static void test_tjc1_compat() {
 // Exact seeking as TJC Studio does it: a parse-only pass (apply = false) records
 // per frame the oldest "last sent" frame over all tiles; decoding from there
 // must reproduce frame T exactly.
-static void test_seek_sync(RefreshMode mode, uint32_t param, uint32_t keyframe_every, int tile, bool motion = true) {
+static void test_seek_sync(RefreshMode mode, uint32_t param, uint32_t keyframe_every, int tile, bool motion = true,
+                           int split = 0, uint32_t kbps = 0) {
     Config cfg;
     cfg.width = 96;
     cfg.height = 64;
     cfg.motion = motion;
+    cfg.split_levels = uint8_t(split);
+    cfg.bitrate_kbps = kbps;
     cfg.tile_w = cfg.tile_h = uint8_t(tile);
     cfg.refresh_mode = mode;
     cfg.refresh_param = param;
@@ -737,7 +782,7 @@ static void test_seek_sync(RefreshMode mode, uint32_t param, uint32_t keyframe_e
         const size_t tiles = size_t(d.layout().tiles);
         (void)tiles;
         SyncTracker tracker;
-        tracker.reset(d.layout());
+        tracker.reset(d.unit_layout());
         int last_tables = -1;
         std::vector<uint8_t> before(frame_size(96, 64)), after(before.size());
         d.copy_frame(before.data());
@@ -750,7 +795,7 @@ static void test_seek_sync(RefreshMode mode, uint32_t param, uint32_t keyframe_e
                            st.audio_bytes == ref_stats[t].audio_bytes && d.audio_samples() == 0;
             if (st.tables) last_tables = int(t);
             offsets.push_back(off);
-            sync.push_back(tracker.add_frame(t, d.tile_info()));
+            sync.push_back(tracker.add_frame(t, d.unit_info()));
             tables_at.push_back(last_tables);
         }
         d.copy_frame(after.data());
@@ -777,9 +822,9 @@ static void test_seek_sync(RefreshMode mode, uint32_t param, uint32_t keyframe_e
         exact &= out == ref[size_t(t)];
     }
     CHECK(exact);
-    std::printf("  %-8s param %-3u keyframe %-3u tile %-2d motion %d: avg %.1f frames decoded per seek\n",
+    std::printf("  %-8s param %-3u keyframe %-3u tile %-2d motion %d split %d kbps %-4u: avg %.1f frames decoded per seek\n",
                 mode == RefreshMode::None ? "none" : mode == RefreshMode::Rolling ? "rolling" : "periodic", param,
-                keyframe_every, tile, int(motion), double(decoded) / frames);
+                keyframe_every, tile, int(motion), split, kbps, double(decoded) / frames);
 }
 
 static void test_seeking() {
@@ -791,6 +836,11 @@ static void test_seeking() {
     test_seek_sync(RefreshMode::None, 0, 15, 7);
     test_seek_sync(RefreshMode::Rolling, 4, 0, 16, false);
     test_seek_sync(RefreshMode::Rolling, 6, 0, 13);
+    test_seek_sync(RefreshMode::Rolling, 1, 0, 32, true, 2);        // TJC4 quadtree
+    test_seek_sync(RefreshMode::FullPeriodic, 12, 0, 32, true, 2);
+    test_seek_sync(RefreshMode::None, 0, 20, 16, true, 1);
+    test_seek_sync(RefreshMode::Rolling, 2, 0, 16, true, 0, 300);   // TJC4 fixed tiles + rate control
+    test_seek_sync(RefreshMode::Rolling, 1, 0, 32, false, 2, 300);
 }
 
 // --- TJC3 -------------------------------------------------------------------
@@ -919,7 +969,9 @@ struct RunResult {
     std::vector<uint8_t> stream;
     bool exact = true;
     double min_psnr = 99;
-    uint64_t inter = 0, dropped = 0, tables = 0;
+    uint64_t inter = 0, dropped = 0, tables = 0, deferred = 0, leaves = 0, dirty = 0;
+    std::vector<size_t> sizes;
+    std::vector<int> quality;
 };
 
 static RunResult run_tjc3(Config cfg, int frames, int speed, bool noise, bool box = false) {
@@ -938,6 +990,11 @@ static RunResult run_tjc3(Config cfg, int frames, int speed, bool noise, bool bo
         r.inter += st.inter_tiles;
         r.dropped += st.dropped_tiles;
         r.tables += st.tables;
+        r.deferred += st.deferred_tiles;
+        r.leaves += st.leaves;
+        r.dirty += st.dirty_tiles;
+        r.sizes.push_back(st.bytes);
+        r.quality.push_back(st.quality);
         rec.emplace_back(f.size());
         enc.copy_recon(rec.back().data());
         src.push_back(std::move(f));
@@ -1028,6 +1085,181 @@ static void test_tjc3_pipeline() {
     CHECK(r.exact);
 }
 
+// --- TJC4 -------------------------------------------------------------------
+
+static void test_tjc4_pipeline() {
+    std::printf("TJC4: quadtree tiles, per-frame quality\n");
+    struct Case { const char* name; int w, h, tile, split, speed; bool noise, motion, box; uint32_t refresh; };
+    const Case cases[] = {
+        {"fixed 16, pan", 160, 96, 16, 0, 3, false, true, false, 2},
+        {"quadtree 32/2, pan", 160, 96, 32, 2, 3, false, true, false, 1},
+        {"quadtree 64/3, pan", 160, 96, 64, 3, 3, false, true, false, 1},
+        {"quadtree 64/3, box", 192, 128, 64, 3, 0, false, true, true, 0},
+        {"fixed 16, box", 192, 128, 16, 0, 0, false, true, true, 0},
+        {"quadtree, no motion", 160, 96, 32, 2, 3, false, false, false, 1},
+        {"quadtree, odd size", 131, 77, 32, 2, 5, false, true, false, 1},
+        {"quadtree 48/1, noise", 150, 90, 48, 1, 2, true, true, false, 1},
+        {"quadtree 128/4", 200, 140, 128, 4, 3, false, true, false, 1},
+        {"fixed 200x200 tiles", 300, 200, 200, 0, 3, false, true, false, 1},
+    };
+    size_t box_fixed = 0, box_tree = 0;
+    for (const Case& c : cases) {
+        Config cfg;
+        cfg.width = uint16_t(c.w);
+        cfg.height = uint16_t(c.h);
+        cfg.tile_w = cfg.tile_h = uint8_t(c.tile);
+        cfg.split_levels = uint8_t(c.split);
+        cfg.format = 4;
+        cfg.motion = c.motion;
+        cfg.refresh_param = c.refresh;
+        if (!c.refresh) cfg.refresh_mode = RefreshMode::None;
+        RunResult r = run_tjc3(cfg, 24, c.speed, c.noise, c.box);
+        CHECK(r.exact);
+        CHECK(r.min_psnr > 30.0);
+        CHECK(std::memcmp(r.stream.data(), "TJC4", 4) == 0);
+        if (c.split) CHECK(r.leaves > r.dirty);  // some tiles were split
+        if (!c.motion) CHECK(r.inter == 0);
+        if (std::string(c.name) == "fixed 16, box") box_fixed = r.stream.size();
+        if (std::string(c.name) == "quadtree 64/3, box") box_tree = r.stream.size();
+        std::printf("  %-22s %7zu B  min PSNR %5.2f  sent tiles %5llu  leaves %5llu  inter %5llu\n", c.name,
+                    r.stream.size(), r.min_psnr, (unsigned long long)r.dirty, (unsigned long long)r.leaves,
+                    (unsigned long long)r.inter);
+    }
+    CHECK(box_tree < box_fixed);  // small moving objects: big tiles only send small leaves
+
+    // Same picture through TJC3 and TJC4 with fixed tiles (only the syntax differs).
+    {
+        Config cfg;
+        cfg.width = 160;
+        cfg.height = 96;
+        cfg.refresh_param = 2;
+        cfg.format = 3;
+        RunResult a = run_tjc3(cfg, 12, 3, false);
+        cfg.format = 4;
+        RunResult b = run_tjc3(cfg, 12, 3, false);
+        CHECK(a.exact && b.exact && a.min_psnr == b.min_psnr);
+    }
+    // Output does not depend on the thread count, rate control included.
+    std::vector<uint8_t> ref;
+    for (int threads : {1, 2, 5}) {
+        Config cfg;
+        cfg.width = 200;
+        cfg.height = 128;
+        cfg.tile_w = cfg.tile_h = 32;
+        cfg.split_levels = 2;
+        cfg.threads = threads;
+        cfg.bitrate_kbps = 400;
+        cfg.max_bitrate_kbps = 600;
+        RunResult r = run_tjc3(cfg, 20, 3, true);
+        CHECK(r.exact);
+        if (ref.empty()) ref = r.stream;
+        CHECK(r.stream == ref);
+    }
+    // Invalid quadtree setups are refused.
+    Encoder e;
+    Config bad;
+    bad.width = 64;
+    bad.height = 64;
+    bad.tile_w = bad.tile_h = 64;
+    bad.split_levels = 4;  // leaf 4
+    CHECK(!e.init(bad));
+    bad.split_levels = 2;
+    bad.format = 3;  // quadtree needs TJC4
+    CHECK(!e.init(bad));
+    bad.format = 2;
+    bad.split_levels = 0;  // TJC2 with motion on
+    CHECK(!e.init(bad));
+}
+
+// Busiest window of `n` frames, in bits.
+static double max_window(const std::vector<size_t>& sizes, size_t n, size_t first = 0) {
+    double best = 0;
+    for (size_t i = first; i + n <= sizes.size(); ++i) {
+        double s = 0;
+        for (size_t k = i; k < i + n; ++k) s += 8.0 * double(sizes[k]);
+        best = std::max(best, s);
+    }
+    return best;
+}
+
+static void test_rate_control() {
+    std::printf("rate control\n");
+    struct Case { const char* name; int format, split; uint32_t kbps, max_kbps; int speed; bool noise; };
+    const Case cases[] = {
+        {"TJC4 target 300", 4, 2, 300, 0, 3, true},
+        {"TJC4 target 900", 4, 0, 900, 0, 3, true},  // more than quality 75 needs
+        {"TJC4 target+cap", 4, 2, 300, 450, 5, true},
+        {"TJC4 cap only", 4, 2, 0, 400, 5, true},
+        {"TJC3 cap only", 3, 0, 0, 400, 5, true},
+        {"TJC2 cap only", 2, 0, 0, 400, 5, true},
+    };
+    for (const Case& c : cases) {
+        Config cfg;
+        cfg.width = 192;
+        cfg.height = 128;
+        cfg.tile_w = cfg.tile_h = uint8_t(c.split ? 32 : 16);
+        cfg.split_levels = uint8_t(c.split);
+        cfg.format = c.format;
+        if (c.format == 2) cfg.motion = cfg.adaptive_huffman = false;
+        cfg.bitrate_kbps = c.kbps;
+        cfg.max_bitrate_kbps = c.max_kbps;
+        cfg.min_quality = 1;
+        cfg.audio_channels = 0;
+        const int frames = 150;  // 5 s at 30 fps
+        RunResult r = run_tjc3(cfg, frames, c.speed, c.noise);
+        CHECK(r.exact);
+        double total = 0;
+        for (size_t b : r.sizes) total += 8.0 * double(b);
+        const double avg = total / (frames / 30.0) / 1000.0;
+        const double peak = max_window(r.sizes, 30) / 1000.0;
+        int qmin = 100, qmax = 0;
+        for (int q : r.quality) qmin = std::min(qmin, q), qmax = std::max(qmax, q);
+        if (c.kbps == 900) CHECK(avg < 900 && qmin == 75 && qmax == 75);  // never above the set quality
+        else if (c.kbps) CHECK(std::fabs(avg - c.kbps) < 0.1 * c.kbps);
+        if (c.max_kbps) CHECK(peak <= c.max_kbps * 1.01);
+        if (c.format == 4 && c.kbps && c.kbps != 900) CHECK(qmin < qmax);  // quality moved
+        if (c.format < 4) CHECK(qmin == qmax);
+        std::printf("  %-18s avg %6.1f kbit/s  peak 1 s %6.1f  quality %d..%d  deferred %llu\n", c.name, avg, peak,
+                    qmin, qmax, (unsigned long long)r.deferred);
+    }
+}
+
+// Thin edges moving across blocks leave single wrong pixels behind unless the
+// peak threshold catches them.
+static void test_peak_threshold() {
+    std::printf("peak threshold (ghost specks)\n");
+    const int w = 128, h = 96, frames = 40;
+    auto make = [&](std::vector<uint8_t>& f, int t) {
+        f.assign(frame_size(w, h), 128);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                // A dark diagonal band with a bright 1-2 pixel rim, moving 1.3 px per frame.
+                double d = (x - 0.6 * y) - (10 + 1.3 * t);
+                f[size_t(y) * w + x] = uint8_t(d > 0 && d < 30 ? 40 : (d >= 30 && d < 31.5 ? 235 : 200));
+            }
+    };
+    size_t bad[2] = {0, 0};
+    for (int pass = 0; pass < 2; ++pass) {
+        Config cfg;
+        cfg.width = w;
+        cfg.height = h;
+        cfg.peak_threshold = pass ? 32 : 0;
+        cfg.refresh_mode = RefreshMode::None;
+        Encoder enc;
+        CHECK(enc.init(cfg));
+        std::vector<uint8_t> f, rec(frame_size(w, h)), out;
+        for (int t = 0; t < frames; ++t) {
+            make(f, t);
+            out.clear();
+            enc.encode_frame(f.data(), out);
+            enc.copy_recon(rec.data());
+            for (size_t i = 0; i < size_t(w) * h; ++i) bad[pass] += std::abs(int(f[i]) - int(rec[i])) > 48;
+        }
+    }
+    std::printf("  pixels off by more than 48: %zu without, %zu with the peak threshold\n", bad[0], bad[1]);
+    CHECK(bad[1] * 4 < bad[0]);
+}
+
 static void test_corrupt_input() {
     std::printf("corrupt / truncated input\n");
     Config cfg;
@@ -1045,6 +1277,47 @@ static void test_corrupt_input() {
         make_audio(pcm, size_t(t) * 1470, enc.samples_for_next_frame(), 2, 44100);
         enc.push_audio(pcm.data(), pcm.size() / 2);
         enc.encode_frame(f.data(), stream);
+    }
+    // A TJC4 quadtree stream goes through the same mill below.
+    Config cfg4;
+    cfg4.width = 64;
+    cfg4.height = 48;
+    cfg4.tile_w = cfg4.tile_h = 32;
+    cfg4.split_levels = 2;
+    cfg4.bitrate_kbps = 200;
+    Encoder enc4;
+    CHECK(enc4.init(cfg4));
+    std::vector<uint8_t> stream4;
+    enc4.write_stream_header(stream4);
+    for (int t = 0; t < 6; ++t) {
+        make_frame(f, 64, 48, t);
+        enc4.encode_frame(f.data(), stream4);
+    }
+    for (const std::vector<uint8_t>* sp : {&stream4}) {
+        const std::vector<uint8_t>& st4 = *sp;
+        for (size_t cut = 0; cut < st4.size(); cut += 5) {
+            MemoryReader mr{st4.data(), cut, 0};
+            Decoder dec;
+            if (dec.read_header(MemoryReader::read, &mr) != Status::Ok) continue;
+            while (dec.decode_frame(MemoryReader::read, &mr) == Status::Ok) {
+            }
+        }
+        int errors4 = 0;
+        for (int iter = 0; iter < 300; ++iter) {
+            std::vector<uint8_t> bad = st4;
+            for (int k = 0; k < 3; ++k) bad[kStreamHeaderSize + rnd() % (bad.size() - kStreamHeaderSize)] ^= uint8_t(1 + rnd() % 255);
+            for (bool apply : {true, false}) {
+                MemoryReader mr{bad.data(), bad.size(), 0};
+                Decoder dec;
+                CHECK(dec.read_header(MemoryReader::read, &mr) == Status::Ok);
+                Status st;
+                while ((st = dec.decode_frame(MemoryReader::read, &mr, nullptr, apply)) == Status::Ok) {
+                }
+                errors4 += apply && st != Status::EndOfStream;
+            }
+        }
+        std::printf("  TJC4: %d/300 damaged streams reported an error\n", errors4);
+        CHECK(errors4 > 0);
     }
     // Truncation at every possible length must never crash and never report Ok past the end.
     for (size_t cut = 0; cut < stream.size(); cut += 7) {
@@ -1096,6 +1369,9 @@ int main() {
     test_exp_golomb();
     test_predict_block();
     test_tjc3_pipeline();
+    test_tjc4_pipeline();
+    test_rate_control();
+    test_peak_threshold();
     test_corrupt_input();
     std::printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;

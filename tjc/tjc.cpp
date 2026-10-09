@@ -1,4 +1,4 @@
-// tjc - command line encoder/decoder for the Tiled-JPEG Codec (TJC3, reads TJC1/2 too).
+// tjc - command line encoder/decoder for the Tiled-JPEG Codec (TJC4, reads TJC1-3 too).
 //
 //   tjc encode --width W --height H [options] [--audio in.wav] [-i in.yuv] [-o out.tjc]
 //   tjc decode [-i in.tjc] [-o out.yuv] [--audio-out out.wav]
@@ -32,7 +32,7 @@ namespace {
 
 void usage() {
     std::fprintf(stderr,
-        "Tiled-JPEG Codec (TJC3)\n"
+        "Tiled-JPEG Codec (TJC4)\n"
         "\n"
         "usage:\n"
         "  tjc encode --width W --height H [options] [-i in.yuv] [-o out.tjc]\n"
@@ -58,7 +58,8 @@ void usage() {
         "compression tools:\n"
         "  --motion on|off            motion compensation (default on; the decoder keeps one extra frame)\n"
         "  --huffman adaptive|standard  Huffman tables fitted to the video (default adaptive)\n"
-        "  --format tjc2              plain TJC2 stream for older decoders (= --motion off --huffman standard)\n"
+        "  --format tjc2|tjc3|tjc4    stream format (default: the oldest one the options need).\n"
+        "                             tjc2 = for TJC2 decoders (also turns motion and adaptive Huffman off)\n"
         "  --deadzone X               AC rounding point 0..0.5 (default 0.33; 0.5 = plain rounding)\n"
         "  --smart-refresh on|off     rolling refresh skips recently sent tiles (default on)\n"
         "  --skip-invisible T         drop updates changing no 8x8 block by more than T per pixel\n"
@@ -66,6 +67,21 @@ void usage() {
         "  --motion-range N           motion search range in pixels (default 32)\n"
         "  --effort fast|normal|best  encoder speed vs size (default normal; never changes the format)\n"
         "  --sync-window N            max frames a decoder must go back to seek (default automatic)\n"
+        "  --peak-threshold P         also re-send a tile when any pixel changed by more than P\n"
+        "                             (default 32, 0 = off); fixes specks left behind by thin moving edges\n"
+        "\n"
+        "TJC4 (newer decoders only):\n"
+        "  --split-levels N           variable tile size: each tile is a quadtree split up to N times\n"
+        "                             (0..4, needs square tiles, smallest leaf >= 8; e.g. 64x64 + 3 = 64..8)\n"
+        "  --quadtree                 shorthand for --tile-size 64x64 --split-levels 3\n"
+        "  --bitrate RATE             average bitrate target, audio included: 800k, 2.5M, 1500 (kbit/s);\n"
+        "                             quality then moves per frame between --min-quality and --quality\n"
+        "  --maxrate RATE             hard cap over any --bufsize window: frames get re-coded lower or\n"
+        "                             dirty tiles wait for the next frame (full refresh frames excepted)\n"
+        "  --bufsize MS               cap window in milliseconds (default 1000)\n"
+        "  --min-quality Q            lowest quality rate control may use (default 10)\n"
+        "                             (with --format tjc2/tjc3 rate control can only use threshold, deadzone\n"
+        "                             and skipping, plus the cap)\n"
         "\n"
         "decode options:\n"
         "  --audio-out FILE.wav       write the audio track as a 16-bit PCM WAV file\n"
@@ -85,7 +101,7 @@ struct Options {
     std::string in = "-", out = "-";
     std::string audio_in, audio_out;
     tjc::Config cfg;
-    bool have_w = false, have_h = false, have_fps = false;
+    bool have_w = false, have_h = false, have_fps = false, have_format = false, have_refresh_param = false;
     uint32_t keyframe_every = 0;
     bool verbose = false, quiet = false, psnr = false;
 };
@@ -113,6 +129,22 @@ void parse_pair(const char* s, const char* what, long& a, long& b) {
     }
     a = parse_int(str.substr(0, x).c_str(), what, 1, 65535);
     b = parse_int(str.substr(x + 1).c_str(), what, 1, 65535);
+}
+
+// Bitrate in kbit/s: "1500", "800k", "2.5M" (plain numbers are kbit/s).
+uint32_t parse_kbps(const char* s, const char* what) {
+    char* end = nullptr;
+    double v = std::strtod(s, &end);
+    if (!*s || !(v > 0)) die("invalid value for %s", what);
+    std::string unit(end);
+    if (unit == "" || unit == "k" || unit == "K" || unit == "kbps" || unit == "kbit") {
+    } else if (unit == "M" || unit == "m" || unit == "Mbps" || unit == "mbit") {
+        v *= 1000;
+    } else {
+        die("invalid unit for %s (use e.g. 800k or 2.5M)", what);
+    }
+    if (v > 4e6) die("%s is too high", what);
+    return uint32_t(std::max(1.0, std::round(v)));
 }
 
 // "30", "30000/1001", or a decimal such as "29.97" (NTSC rates map to x000/1001).
@@ -219,6 +251,7 @@ Options parse_args(int argc, char** argv) {
             else die("unknown refresh mode '%s' (none | full | rolling)", m.c_str());
         } else if (a == "--refresh-param") {
             o.cfg.refresh_param = uint32_t(parse_int(next(), "--refresh-param", 0, 65535));
+            o.have_refresh_param = true;
         } else if (a == "--quality") {
             o.cfg.quality = uint8_t(parse_int(next(), "--quality", 1, 100));
         } else if (a == "--diff-ref") {
@@ -240,8 +273,11 @@ Options parse_args(int argc, char** argv) {
             o.cfg.adaptive_huffman = m == "adaptive";
         } else if (a == "--format") {
             std::string m = next();
-            if (m == "tjc2") { o.cfg.motion = false; o.cfg.adaptive_huffman = false; }
-            else if (m != "tjc3") die("--format takes tjc2 or tjc3");
+            o.have_format = true;
+            if (m == "tjc2") { o.cfg.motion = false; o.cfg.adaptive_huffman = false; o.cfg.format = 2; }
+            else if (m == "tjc3") o.cfg.format = 3;
+            else if (m == "tjc4") o.cfg.format = 4;
+            else die("--format takes tjc2, tjc3 or tjc4");
         } else if (a == "--deadzone") {
             o.cfg.deadzone = std::atof(next());
             if (!(o.cfg.deadzone >= 0 && o.cfg.deadzone <= 0.5)) die("--deadzone must be 0..0.5");
@@ -262,6 +298,21 @@ Options parse_args(int argc, char** argv) {
             o.cfg.motion_range = int(parse_int(next(), "--motion-range", 1, 1024));
         } else if (a == "--sync-window") {
             o.cfg.sync_window = uint32_t(parse_int(next(), "--sync-window", 0, 1L << 30));
+        } else if (a == "--peak-threshold") {
+            o.cfg.peak_threshold = uint32_t(parse_int(next(), "--peak-threshold", 0, 255));
+        } else if (a == "--split-levels") {
+            o.cfg.split_levels = uint8_t(parse_int(next(), "--split-levels", 0, tjc::kMaxSplitLevels));
+        } else if (a == "--quadtree") {
+            o.cfg.tile_w = o.cfg.tile_h = 64;
+            o.cfg.split_levels = 3;
+        } else if (a == "--bitrate" || a == "-b") {
+            o.cfg.bitrate_kbps = parse_kbps(next(), "--bitrate");
+        } else if (a == "--maxrate") {
+            o.cfg.max_bitrate_kbps = parse_kbps(next(), "--maxrate");
+        } else if (a == "--bufsize") {
+            o.cfg.buffer_ms = uint32_t(parse_int(next(), "--bufsize", 10, 60000));
+        } else if (a == "--min-quality") {
+            o.cfg.min_quality = uint8_t(parse_int(next(), "--min-quality", 1, 100));
         } else if (a == "--psnr") {
             o.psnr = true;
         } else {
@@ -442,14 +493,23 @@ void print_header(const tjc::StreamHeader& h, const tjc::Layout& l) {
     if (h.version >= 3)
         std::fprintf(stderr, "tools:  motion compensation %s, adaptive Huffman tables %s\n",
                      (h.flags & tjc::kFlagMotion) ? "on" : "off", (h.flags & tjc::kFlagAdaptiveHuffman) ? "on" : "off");
+    if (h.version >= 4) {
+        if (h.split_levels)
+            std::fprintf(stderr, "        variable tiles: quadtree %ux%u down to %ux%u (%u levels), per-frame quality\n",
+                         h.tile_w, h.tile_h, h.tile_w >> h.split_levels, h.tile_h >> h.split_levels, h.split_levels);
+        else
+            std::fprintf(stderr, "        fixed tiles, per-frame quality\n");
+    }
 }
 
 void log_frame(const tjc::FrameStats& s, bool audio) {
-    std::fprintf(stderr, "frame %6u %c dirty %5u/%-5u (%5.1f%%) inter %5u%s %8zu B", s.frame_num,
-                 s.force_refresh ? 'I' : 'P', s.dirty_tiles, s.total_tiles,
+    std::fprintf(stderr, "frame %6u %c q%-3u dirty %5u/%-5u (%5.1f%%) inter %5u%s %8zu B", s.frame_num,
+                 s.force_refresh ? 'I' : 'P', s.quality, s.dirty_tiles, s.total_tiles,
                  100.0 * s.dirty_tiles / (s.total_tiles ? s.total_tiles : 1), s.inter_tiles, s.tables ? " T" : "  ",
                  s.bytes);
+    if (s.leaves != s.dirty_tiles) std::fprintf(stderr, " leaves %u", s.leaves);
     if (s.dropped_tiles) std::fprintf(stderr, " dropped %u", s.dropped_tiles);
+    if (s.deferred_tiles) std::fprintf(stderr, " deferred %u", s.deferred_tiles);
     if (audio) std::fprintf(stderr, "  audio %5u smp %6zu B", s.audio_samples, s.audio_bytes);
     std::fprintf(stderr, "\n");
 }
@@ -457,7 +517,24 @@ void log_frame(const tjc::FrameStats& s, bool audio) {
 struct Totals {
     uint64_t frames = 0, iframes = 0, bytes = 0, dirty = 0, tiles = 0;
     uint64_t audio_samples = 0, audio_bytes = 0, audio_padded = 0, inter = 0, dropped = 0, tables = 0;
-    void add(const tjc::FrameStats& s) {
+    uint64_t deferred = 0, leaves = 0, qsum = 0;
+    int qmin = 999, qmax = 0;
+    // Peak bitrate over a sliding one-second window.
+    std::vector<uint64_t> window;
+    size_t wpos = 0;
+    uint64_t wsum = 0, wpeak = 0;
+    void add(const tjc::FrameStats& s, double fps) {
+        if (window.empty()) window.assign(size_t(std::max(1.0, std::round(fps))), 0);
+        wsum -= window[wpos];
+        window[wpos] = s.bytes;
+        wsum += s.bytes;
+        wpos = (wpos + 1) % window.size();
+        wpeak = std::max(wpeak, wsum);
+        deferred += s.deferred_tiles;
+        leaves += s.leaves;
+        qsum += s.quality;
+        qmin = std::min<int>(qmin, s.quality);
+        qmax = std::max<int>(qmax, s.quality);
         inter += s.inter_tiles;
         dropped += s.dropped_tiles;
         tables += s.tables;
@@ -486,6 +563,16 @@ struct Totals {
             std::fprintf(stderr, "      motion compensated %.1f%% of sent tiles, %llu Huffman table updates%s\n",
                          dirty ? 100.0 * double(inter) / double(dirty) : 0.0, (unsigned long long)tables,
                          dropped ? (", " + std::to_string(dropped) + " invisible updates skipped").c_str() : "");
+        if (frames && secs > 0) {
+            double win = double(window.size()) / fps;
+            std::fprintf(stderr, "      peak bitrate %.1f kbit/s (busiest %.3g s window)", double(wpeak) * 8.0 / win / 1000.0, win);
+            if (qmin != qmax)
+                std::fprintf(stderr, ", quality %d..%d (avg %.1f)", qmin, qmax, double(qsum) / double(frames));
+            if (deferred) std::fprintf(stderr, ", %llu tile updates delayed by the cap", (unsigned long long)deferred);
+            if (h.version >= 4 && h.split_levels)
+                std::fprintf(stderr, ", %.1f quadtree leaves per sent tile", dirty ? double(leaves) / double(dirty) : 0.0);
+            std::fprintf(stderr, "\n");
+        }
         if (h.audio_codec)
             std::fprintf(stderr, "      audio: %.2f s, %llu bytes, %.1f kbit/s\n", double(audio_samples) / h.audio_rate,
                          (unsigned long long)audio_bytes, secs > 0 ? double(audio_bytes) * 8.0 / secs / 1000.0 : 0.0);
@@ -494,6 +581,10 @@ struct Totals {
 
 int run_encode(Options o) {
     if (!o.have_w || !o.have_h) die("encode needs --width and --height (or --size WxH)");
+    // Rolling refresh counts tiles; with big quadtree tiles keep the default
+    // refresh speed in pixels (30 tiles of 16x16 per frame).
+    if (o.cfg.split_levels && !o.have_refresh_param && o.cfg.refresh_mode == tjc::RefreshMode::Rolling)
+        o.cfg.refresh_param = uint32_t(std::max(1L, std::lround(30.0 * 256.0 / (double(o.cfg.tile_w) * o.cfg.tile_h))));
     WavReader wav;
     if (!o.audio_in.empty()) {
         if (o.audio_in == o.in) die("--audio and -i cannot both be stdin");
@@ -543,7 +634,7 @@ int run_encode(Options o) {
         enc.encode_frame(frame.data(), buf, &st);
         write_all(out, buf.data(), buf.size());
         stream_bytes += buf.size();
-        tot.add(st);
+        tot.add(st, fps_of(hdr));
         if (o.verbose) log_frame(st, wav.f != nullptr);
         if (o.psnr) {
             enc.copy_recon(recon.data());
@@ -619,7 +710,7 @@ int run_decode(const Options& o, bool write_frames) {
             rc = 1;
             break;
         }
-        tot.add(fs);
+        tot.add(fs, fps_of(h));
         stream_bytes += fs.bytes;
         if (o.verbose || !write_frames) log_frame(fs, h.audio_codec != 0);
         if (write_frames) {

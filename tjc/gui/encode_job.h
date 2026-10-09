@@ -44,6 +44,9 @@ struct EncodeProgress {
     double elapsed = 0;
     double dirty_percent = 0;
     double inter_percent = 0;  // of the sent tiles, motion compensated
+    double recent_kbps = 0;    // bitrate over the last second of output
+    int last_quality = 0;      // quality of the latest frame
+    uint64_t deferred = 0;     // tile updates delayed by the bitrate cap
     uint64_t audio_padded = 0, audio_extra = 0;
     std::string message;
 };

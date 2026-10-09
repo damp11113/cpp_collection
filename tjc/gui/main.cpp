@@ -189,6 +189,12 @@ struct App {
     int keyframe_every = 0, threads = 0;
     bool use_motion = true, adaptive_huff = true;
     int effort = 1;
+    int format = 0;  // 0 auto, 1 TJC2, 2 TJC3, 3 TJC4
+    bool quadtree = false;
+    int leaf_mode = 0;  // smallest leaf of a 64x64 tile: 8, 16, 32
+    int rate_mode = 0;  // 0 constant quality, 1 average, 2 average + cap, 3 cap only
+    int target_kbps = 4000, max_kbps = 6000, buffer_ms = 1000, min_quality = 10;
+    int peak_threshold = 32;
     float skip_invisible = 0.0f;
     bool audio_on = true;
     int audio_rate_mode = 0, audio_ch_mode = 0;
@@ -276,7 +282,7 @@ void drop_callback(GLFWwindow*, int count, const char** paths) {
 // ---------------------------------------------------------------------------
 
 void update_overlay(App& app) {
-    const tjc::Layout& l = app.player.layout();
+    const tjc::Layout& l = app.player.unit_layout();
     app.overlay_rgba.assign(size_t(l.tiles) * 4, 0);
     for (int t = 0; t < l.tiles && size_t(t) < app.shown.dirty.size(); ++t) {
         uint8_t* p = &app.overlay_rgba[size_t(t) * 4];
@@ -311,7 +317,10 @@ void draw_info_panel(App& app) {
     ImGui::Text("TJC%u  %ux%u", h.version, h.width, h.height);
     ImGui::Text("%.3f fps (%u/%u)", p.fps(), h.fps_num, h.fps_den);
     ImGui::Text("Tiles %ux%u  (%d x %d = %d)", h.tile_w, h.tile_h, l.cols, l.rows, l.tiles);
-    ImGui::Text("Quality %u", h.quality);
+    if (h.version >= 4 && h.split_levels)
+        ImGui::Text("Quadtree down to %ux%u", h.tile_w >> h.split_levels, h.tile_h >> h.split_levels);
+    if (h.version >= 4) ImGui::Text("Quality per frame (max %u)", h.quality);
+    else ImGui::Text("Quality %u", h.quality);
     const char* modes[] = {"none", "full periodic", "rolling"};
     ImGui::Text("Refresh %s / %u", modes[int(h.refresh_mode) % 3], h.refresh_param);
     ImGui::TextWrapped("Audio: %s", p.audio_status().c_str());
@@ -326,17 +335,31 @@ void draw_info_panel(App& app) {
     if (p.index_complete() && frames) {
         double secs = frames / p.fps();
         ImGui::Text("%u frames, %s", frames, format_time(secs).c_str());
-        ImGui::Text("Average %.0f kbit/s", double(size) * 8 / secs / 1000);
     } else {
         ImGui::Text("Indexing... %u frames", frames);
+    }
+
+    // Bitrate: now (over the last second), average and the busiest second.
+    const uint32_t second = uint32_t(std::max(1.0, std::round(p.fps())));
+    if (frames) {
+        ImGui::SeparatorText("Bitrate");
+        uint32_t at = std::min(app.have_frame ? app.shown.index : p.current_frame(), frames - 1);
+        ImGui::Text("Now      %8.0f kbit/s", p.bitrate_kbps(at, second));
+        if (p.index_complete()) {
+            double secs = frames / p.fps();
+            ImGui::Text("Average  %8.0f kbit/s", double(size) * 8 / secs / 1000);
+        }
+        ImGui::Text("Peak 1 s %8.0f kbit/s%s", p.peak_kbps(), p.index_complete() ? "" : "+");
     }
 
     if (app.have_frame) {
         const tjc::FrameStats& s = app.shown.stats;
         ImGui::SeparatorText("This frame");
         ImGui::Text("#%u  %s", app.shown.index, s.force_refresh ? "full refresh" : "update");
+        if (h.version >= 4) ImGui::Text("Quality %u", s.quality);
         ImGui::Text("Tiles %u / %u (%.1f%%)", s.dirty_tiles, s.total_tiles,
                     s.total_tiles ? 100.0 * s.dirty_tiles / s.total_tiles : 0.0);
+        if (h.version >= 4 && h.split_levels) ImGui::Text("Quadtree leaves %u", s.leaves);
         if (h.flags & tjc::kFlagMotion) ImGui::Text("Motion compensated %u", s.inter_tiles);
         if (s.tables) ImGui::TextUnformatted("New Huffman tables");
         ImGui::Text("Size %s", format_bytes(double(s.bytes)).c_str());
@@ -365,6 +388,31 @@ void draw_info_panel(App& app) {
         std::snprintf(overlay, sizeof(overlay), "peak %.0f KB", vmax);
         ImGui::PlotHistogram("##sizes", vals.data(), int(vals.size()), 0, overlay, 0, vmax * 1.1f,
                              ImVec2(-1, ImGui::GetFontSize() * 6));
+
+        // Bitrate over the same span, one-second windows.
+        static std::vector<float> rate;
+        rate.clear();
+        float rmax = 1;
+        for (uint32_t f = first; f < first + span && f < frames; ++f) {
+            rate.push_back(float(p.bitrate_kbps(f, second)));
+            rmax = std::max(rmax, rate.back());
+        }
+        ImGui::SeparatorText("Bitrate (kbit/s, 1 s window)");
+        std::snprintf(overlay, sizeof(overlay), "max %.0f", rmax);
+        ImGui::PlotLines("##rate", rate.data(), int(rate.size()), 0, overlay, 0, rmax * 1.15f,
+                         ImVec2(-1, ImGui::GetFontSize() * 6));
+        if (h.version >= 4) {
+            static std::vector<float> qs;
+            qs.clear();
+            for (uint32_t f = first; f < first + span && f < frames; ++f) {
+                uint8_t q = 0;
+                p.index_entry(f, nullptr, nullptr, &q);
+                qs.push_back(float(q));
+            }
+            ImGui::SeparatorText("Quality per frame");
+            ImGui::PlotLines("##quality", qs.data(), int(qs.size()), 0, nullptr, 0, 100,
+                             ImVec2(-1, ImGui::GetFontSize() * 4));
+        }
     }
 }
 
@@ -410,7 +458,8 @@ void draw_player(App& app) {
             ImVec2 p1(p0.x + sz.x, p0.y + sz.y);
             dl->AddImage(app.video_tex.im(), p0, p1);
             if (app.show_overlay) {
-                ImVec2 uv1(float(l.width) / float(l.cols * l.tile_w), float(l.height) / float(l.rows * l.tile_h));
+                const tjc::Layout& u = p.unit_layout();
+                ImVec2 uv1(float(l.width) / float(u.cols * u.tile_w), float(l.height) / float(u.rows * u.tile_h));
                 dl->AddImage(app.overlay_tex.im(), p0, p1, ImVec2(0, 0), uv1);
             }
         } else if (!p.is_open()) {
@@ -537,10 +586,24 @@ bool build_settings(App& app, EncodeSettings& s, std::string& err) {
     static const int tiles[] = {8, 16, 32, 48, 64};
     if (app.tile_mode < 5) c.tile_w = c.tile_h = uint8_t(tiles[app.tile_mode]);
     else { c.tile_w = uint8_t(std::clamp(app.tile_w, 1, 255)); c.tile_h = uint8_t(std::clamp(app.tile_h, 1, 255)); }
+    static const int formats[] = {0, 2, 3, 4};
+    c.format = formats[std::clamp(app.format, 0, 3)];
+    if (app.quadtree) {
+        c.tile_w = c.tile_h = 64;
+        c.split_levels = uint8_t(3 - std::clamp(app.leaf_mode, 0, 2));
+    }
+    if (app.rate_mode == 1 || app.rate_mode == 2) c.bitrate_kbps = uint32_t(std::max(1, app.target_kbps));
+    if (app.rate_mode >= 2) c.max_bitrate_kbps = uint32_t(std::max(1, app.max_kbps));
+    c.buffer_ms = uint32_t(std::clamp(app.buffer_ms, 10, 60000));
+    c.min_quality = uint8_t(std::clamp(app.min_quality, 1, 100));
+    c.peak_threshold = uint32_t(std::clamp(app.peak_threshold, 0, 255));
     c.quality = uint8_t(std::clamp(app.quality, 1, 100));
     c.motion_threshold_k = uint32_t(std::max(0, app.motion));
     c.refresh_mode = tjc::RefreshMode(app.refresh_mode);
     c.refresh_param = uint32_t(std::clamp(app.refresh_param, 0, 65535));
+    // Rolling refresh counts tiles: keep the pixel rate of the setting (16x16 tiles).
+    if (app.quadtree && c.refresh_mode == tjc::RefreshMode::Rolling)
+        c.refresh_param = uint32_t(std::max(1L, std::lround(c.refresh_param * 256.0 / (64.0 * 64.0))));
     c.diff_reference = tjc::DiffReference(app.diff_ref);
     c.threads = std::max(0, app.threads);
     c.motion = app.use_motion;
@@ -661,18 +724,32 @@ void draw_encoder(App& app) {
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
         ImGui::InputInt("Threads (0=all)", &app.threads);
 
-        ImGui::SeparatorText("Compression (TJC3)");
+        ImGui::SeparatorText("Compression");
         ImGui::Checkbox("Motion compensation", &app.use_motion);
         help_marker("Tiles can be predicted from the previous frame: big savings on pans and moving objects. "
                     "The player/decoder then keeps one extra frame in memory.");
         ImGui::Checkbox("Adaptive Huffman tables", &app.adaptive_huff);
         help_marker("Entropy tables fitted to the video, resent only when it pays off.");
-        bool tjc2 = !app.use_motion && !app.adaptive_huff;
-        if (ImGui::Checkbox("TJC2 compatible", &tjc2)) {
-            app.use_motion = !tjc2;
-            app.adaptive_huff = !tjc2;
+        const char* fmts[] = {"Auto", "TJC2", "TJC3", "TJC4"};
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
+        if (ImGui::Combo("Format", &app.format, fmts, 4) && app.format == 1) {
+            app.use_motion = app.adaptive_huff = false;
+            app.quadtree = false;
         }
-        help_marker("Turns both off: the file then plays on older TJC2 decoders (still ~5% smaller than before).");
+        help_marker("Auto picks the oldest format the settings need. TJC2 plays on the oldest decoders "
+                    "(motion and adaptive tables off). TJC4 adds variable tile size and per-frame quality "
+                    "for rate control; it needs a TJC4 decoder.");
+        if (app.format == 1 || app.format == 2) ImGui::BeginDisabled();
+        ImGui::Checkbox("Variable tile size (quadtree)", &app.quadtree);
+        help_marker("TJC4: 64x64 tiles split down to smaller squares where it pays: big areas cost one vector, "
+                    "small changes only send small leaves. ~10% smaller on video, more on motion graphics; "
+                    "encoding about 2x slower. Overrides the tile size.");
+        if (app.quadtree) {
+            const char* leaves[] = {"8x8", "16x16", "32x32"};
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
+            ImGui::Combo("Smallest leaf", &app.leaf_mode, leaves, 3);
+        }
+        if (app.format == 1 || app.format == 2) ImGui::EndDisabled();
         const char* efforts[] = {"Fast", "Normal", "Best"};
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
         ImGui::Combo("Effort", &app.effort, efforts, 3);
@@ -682,6 +759,34 @@ void draw_encoder(App& app) {
         ImGui::SliderFloat("Skip invisible", &app.skip_invisible, 0.0f, 4.0f, app.skip_invisible > 0 ? "%.1f" : "off");
         help_marker("Leave out tile updates that change no 8x8 block by more than this per pixel. "
                     "1-2 shrinks grainy video a lot; static areas keep their last grain pattern.");
+
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
+        ImGui::SliderInt("Peak threshold", &app.peak_threshold, 0, 128, app.peak_threshold ? "%d" : "off");
+        help_marker("Also re-send a tile when any single pixel changed by more than this. Fixes wrong-colored "
+                    "specks left behind by thin moving edges; costs almost nothing. 0 = off.");
+
+        ImGui::SeparatorText("Rate control");
+        const char* rmodes[] = {"Constant quality", "Average bitrate", "Average + max", "Max bitrate only"};
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 11);
+        ImGui::Combo("Mode##rate", &app.rate_mode, rmodes, 4);
+        help_marker("Average: quality moves per frame between Min quality and Quality to hit the target "
+                    "(audio included). Max: a hard cap over the buffer window; frames are re-coded lower or "
+                    "tile updates wait a frame. Per-frame quality needs TJC4; TJC2/TJC3 can only raise the "
+                    "threshold, deadzone and skipping.");
+        if (app.rate_mode == 1 || app.rate_mode == 2) {
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
+            ImGui::InputInt("Target kbit/s", &app.target_kbps, 100, 1000);
+        }
+        if (app.rate_mode >= 2) {
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
+            ImGui::InputInt("Max kbit/s", &app.max_kbps, 100, 1000);
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
+            ImGui::InputInt("Buffer ms", &app.buffer_ms, 100, 1000);
+        }
+        if (app.rate_mode) {
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 12);
+            ImGui::SliderInt("Min quality", &app.min_quality, 1, 100);
+        }
 
         ImGui::SeparatorText("Audio");
         bool has_audio = app.info.ok && app.info.has_audio;
@@ -740,9 +845,14 @@ void draw_encoder(App& app) {
         double eta = speed > 0 && pr.total_estimate > pr.frames ? double(pr.total_estimate - pr.frames) / speed : 0;
         ImGui::Text("%.1f fps (%.2fx realtime)   elapsed %s   ETA %s", speed, speed / fps,
                     format_time(pr.elapsed).c_str(), pr.running ? format_time(eta).c_str() : "-");
-        ImGui::Text("Output %s   %.0f kbit/s   dirty tiles %.1f%% (%.0f%% motion comp.)   audio %.0f kbit/s",
+        ImGui::Text("Output %s   %.0f kbit/s (last second %.0f)   quality %d   audio %.0f kbit/s",
                     format_bytes(double(pr.bytes)).c_str(), secs > 0 ? double(pr.bytes) * 8 / secs / 1000 : 0.0,
-                    pr.dirty_percent, pr.inter_percent, secs > 0 ? double(pr.audio_bytes) * 8 / secs / 1000 : 0.0);
+                    pr.recent_kbps, pr.last_quality, secs > 0 ? double(pr.audio_bytes) * 8 / secs / 1000 : 0.0);
+        ImGui::Text("Dirty tiles %.1f%% (%.0f%% motion comp.)", pr.dirty_percent, pr.inter_percent);
+        if (pr.deferred) {
+            ImGui::SameLine();
+            ImGui::Text("  %llu tile updates delayed by the cap", (unsigned long long)pr.deferred);
+        }
         ImVec4 col = pr.failed ? ImVec4(1, 0.45f, 0.4f, 1) : (pr.done ? ImVec4(0.5f, 0.9f, 0.5f, 1) : ImVec4(1, 1, 1, 1));
         ImGui::PushTextWrapPos(0);
         ImGui::TextColored(col, "%s", pr.message.c_str());

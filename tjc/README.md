@@ -4,8 +4,9 @@ A small video codec for low-power decoders (written with a single-core MIPS 24KE
 mind: integer-only, no FPU needed). Each frame is split into tiles; only tiles that
 changed (plus tiles picked by a refresh policy) are sent, each as a tiny
 baseline-JPEG-style blob or, in TJC3, as a motion-compensated copy of the previous
-frame plus a small correction. The decoder keeps a persistent framebuffer and
-patches it. An optional audio track is coded with [QOA](https://qoaformat.org) and
+frame plus a small correction. TJC4 adds variable tile size (a quadtree in each
+tile) and a quality per frame, which enables rate control (average target and a
+hard cap). The decoder keeps a persistent framebuffer and patches it. An optional audio track is coded with [QOA](https://qoaformat.org) and
 interleaved per video frame, so audio and video stay in sync by construction.
 
 ## Compression tools (TJC3)
@@ -47,6 +48,99 @@ Encoding TJC3 costs more than TJC2: the motion search. `--effort` picks the trad
 | `normal` (default) | 37 fps | within ~0.5% (2% on motion graphics) |
 | `best` | 23 fps | — |
 
+## TJC4: variable tile size and rate control
+
+### Variable tile size (`--quadtree`)
+
+Each tile, 64x64 by default, is a quadtree. A large area that moves together costs
+one vector. A small change inside a big tile sends only a small leaf, down to 8x8,
+and the rest of the tile is marked "skip". The encoder decides split versus no split
+by rate-distortion cost, so it only splits where splitting pays.
+
+Same picture quality, bytes compared with TJC3 at 16x16 (q75, 1 thread):
+
+| Clip | TJC3 | **TJC4 `--quadtree`** (64 → 8) | 64 → 16 (`--tile-size 64 --split-levels 2`) | Encode time vs TJC3 |
+|------|------|-------------------------------|------------------------------|---------------------|
+| Screen content 720p | 199 KB | **95 KB (-52%)** | 102 KB (-49%) | 2.5x |
+| Camera pan 720p | 1.20 MB | **729 KB (-39%)** | 734 KB (-39%) | 3.0x |
+| Noisy camera 1080p | 5.28 MB | **3.76 MB (-29%)** | 3.79 MB (-28%) | 1.7x |
+| Noisy camera 720p | 3.65 MB | **2.93 MB (-20%)** | 2.97 MB (-19%) | 1.7x |
+| Camera 1080p | 1.45 MB | **1.18 MB (-18%)**, +0.8 dB | 1.21 MB (-16%) | 3.1x |
+| Noisy pan 720p | 2.95 MB | 2.41 MB (-18%) | **2.37 MB (-20%)** | 3.2x / 1.8x |
+| Motion graphics 720p | 1.07 MB | **889 KB (-17%)** | 914 KB (-14%) | 3.3x |
+| Zoom 720p | 1.70 MB | 1.55 MB (-9%) | **1.50 MB (-12%)** | 4.7x / 3.6x |
+| Thin moving edges 720p | 335 KB | **238 KB (-29%)** | 243 KB (-28%) | 3.6x |
+
+The decoder does the same work per pixel, and decoding is 3-15% slower than TJC3
+because of more, smaller blocks. It needs no extra frame memory, only a 6-byte
+entry per smallest leaf (86 KB at 720p with 8x8 leaves, 22 KB with 16x16) that
+tells a player how each area was coded. The decoder-only build grows from 21 KB to
+24 KB. So TJC4 still fits the MIPS target; the extra cost is on the encoder side.
+`--split-levels 0` gives fixed tiles with the TJC4 syntax, which is what you get
+when you only want rate control.
+
+### Rate control (`--bitrate`, `--maxrate`)
+
+- `--bitrate 2M`: average target, audio included. The encoder predicts each frame's
+  size from a rate model (bits ∝ complexity × quantizer step^-α) and chooses a
+  quality between `--min-quality` and `--quality`. When a frame lands far off its
+  target, the encoder codes it again at a corrected quality. Overspending and
+  underspending are paid back over about a second. Quality rises at most 3 steps per
+  frame, so it doesn't pump.
+- `--maxrate 3M --bufsize 1000`: a hard cap. No window of `--bufsize` ms (in whole
+  frames) carries more than the max rate. It is a strict sliding window, not a
+  leaky bucket: a leaky bucket lets the first second burst to twice the cap. The
+  encoder plans the next half-window evenly, so a burst cannot starve the frames
+  after it. If a frame still doesn't fit, it is re-coded lower, down to quality 1,
+  and then the least useful dirty tiles wait for the next frame. Refresh-only tiles
+  go first, then the tiles that improve the picture least per bit. Only a full
+  refresh frame can break the cap, and only in TJC2/TJC3.
+- Both together: target the average, never exceed the max.
+- When even `--min-quality` is too big for the target, the encoder raises the
+  threshold, deadzone and skip-invisible in steps. With `--format tjc2`/`tjc3` there
+  is no per-frame quality, so those steps (plus holding tiles back under a cap) are
+  the only levers. TJC3 with `--maxrate` keeps to the cap by sending updates evenly
+  over time, which shows up as lower temporal resolution on heavy content.
+
+Measured on 720p30 clips, `--quadtree`:
+
+| Clip | Settings | Average | Busiest 1 s | Quality used |
+|------|----------|---------|-------------|--------------|
+| Noisy camera | `--bitrate 2000` | 1992 kbit/s | 2011 kbit/s | 10..30 |
+| Camera pan | `--bitrate 2000 --maxrate 3000` | 1770 kbit/s | 1920 kbit/s | 11..57 |
+| Camera pan | `--maxrate 1500` | 1405 kbit/s | 1476 kbit/s | 10..75 |
+| Noisy camera | `--maxrate 2500` | 2443 kbit/s | 2459 kbit/s | 15..75 |
+| Noisy camera 1080p | `--bitrate 8000` | 8044 kbit/s | 8105 kbit/s | 32..75 |
+
+### How high can the bitrate go?
+
+The theoretical worst case per 8x8 block is 27 + 63×26 bits. In practice, the
+heaviest content possible (full-range random noise, every tile, every frame) at
+quality 100 gives:
+
+| | 720p30 | 1080p30 (scaled) |
+|---|---|---|
+| Random noise, q100 | ~315 Mbit/s | ~710 Mbit/s |
+| Random noise, q75 | ~124 Mbit/s | ~280 Mbit/s |
+| Real camera clip, q100 | ~89 Mbit/s | ~200 Mbit/s |
+| Raw YUV420P, for comparison | 332 Mbit/s | 746 Mbit/s |
+
+So the codec tops out near the raw rate. Use `--maxrate` to keep a link or an SD
+card within its budget.
+
+### Ghost specks (`--peak-threshold`, all formats)
+
+A tile is "dirty" when the mean difference in one of its 8x8 blocks exceeds
+`--motion-threshold`. A thin edge that moves away leaves 1-2 pixels behind, with
+too little mean difference to trigger. Motion compensation then dragged such specks
+along with the edge. Now a tile is also re-sent when any single pixel changed by
+more than `--peak-threshold` (default 32). In addition, the encoder rejects a motion
+compensated tile if it would leave a pixel that far off and intra coding gets it
+clearly closer. On a moving orange edge over a dark panel, pixels more than 40 levels
+off dropped from 3476 to 93, and the file got 4% smaller. Real video costs about
+nothing extra. This is an encoder change only: re-encoded TJC2/TJC3 files play on the
+old decoders.
+
 | File          | What                                                              |
 |---------------|-------------------------------------------------------------------|
 | `tjc.h`       | single-header library: encoder + decoder (stb-style)              |
@@ -82,8 +176,12 @@ all three when you configure the build.
   rolling streams, back to the last full refresh for periodic ones.
 - Tile overlay (`T`): red = tile coded from scratch, green = motion compensated,
   blue = full refresh.
-- Info panel: stream settings, per-frame tiles/bytes/audio, the frame each seek
-  restarts from, and a frame-size graph.
+- Info panel: stream settings, per-frame tiles/bytes/audio/quality, the frame each
+  seek restarts from, a frame-size graph, and bitrate. Bitrate shows now (last
+  second), average and peak (busiest second), plus a bitrate graph and a per-frame
+  quality graph for TJC4.
+- With TJC4 quadtree streams, the overlay shows the leaves themselves; unchanged
+  leaves stay clear.
 - Loop, volume, BT.601/BT.709 color matrix, click the picture to play/pause.
 
 **Encoder tab**
@@ -91,8 +189,12 @@ all three when you configure the build.
 - Output size presets (source/1080p/720p/480p/360p/custom), frame rate, tile size,
   quality, motion threshold, refresh mode, keyframes, threads, audio on/off with
   resampling (rate, stereo/mono).
-- Compression: motion compensation, adaptive Huffman tables, "TJC2 compatible",
-  effort (fast/normal/best) and skip-invisible.
+- Compression: format (auto/TJC2/TJC3/TJC4), motion compensation, adaptive Huffman
+  tables, variable tile size (quadtree, smallest leaf), effort, skip-invisible and
+  peak threshold.
+- Rate control: constant quality, average bitrate, average + max, or max only,
+  with buffer and minimum quality. The progress line shows the last second's
+  bitrate and the current quality.
 - Progress, speed, ETA, bitrate, a live preview of what the decoder will show,
   Cancel (deletes the partial file), and "Play output".
 - Produces the same bytes as `tjc encode` with the same settings.
@@ -246,7 +348,7 @@ inside a `.tjc` are standard QOA frames.
 | `--width` / `--height` / `--size WxH` | required | frame size |
 | `--fps RATE`             | `30`         | frame rate of the input, stored in the stream |
 | `--audio FILE.wav`       | none         | add a QOA audio track from a 16-bit PCM WAV |
-| `--tile-size WxH` or `N` | `16x16`      | 1..255 each; `w*h` at most 12544 (e.g. 64x64, 128x64, 112x112). See "Choosing a tile size" |
+| `--tile-size WxH` or `N` | `16x16`      | 1..255 each; TJC2/TJC3: `w*h` at most 12544 (e.g. 64x64, 112x112). See "Choosing a tile size" |
 | `--motion-threshold K`   | `3`          | tile is dirty when any 8x8 block's mean abs diff per sample is > K; `0` = any change |
 | `--refresh-mode`         | `rolling`    | `none`, `full` (full refresh every N frames), `rolling` (N tiles per frame, round robin) |
 | `--refresh-param N`      | `30`         | N for the refresh mode |
@@ -256,13 +358,20 @@ inside a `.tjc` are standard QOA frames.
 | `--threads N`            | `0`          | encoder threads, `0` = all cores. The output is identical for any value |
 | `--motion on\|off`        | `on`         | motion compensation (TJC3) |
 | `--huffman adaptive\|standard` | `adaptive` | Huffman tables fitted to the video (TJC3) |
-| `--format tjc2`          |              | both of the above off: plays on TJC2 decoders |
 | `--effort fast\|normal\|best` | `normal` | encoder speed vs size |
 | `--deadzone X`           | `0.33`       | AC rounding point, 0..0.5 (0.5 = plain rounding) |
 | `--smart-refresh on\|off` | `on`         | rolling refresh skips recently sent tiles |
 | `--skip-invisible T`     | `0` (off)    | drop updates that change no 8x8 block by more than T per pixel; 1-2 for grainy video |
 | `--motion-range N`       | `32`         | motion search range in pixels |
 | `--sync-window N`        | automatic    | how many frames back a decoder may have to go to seek or join |
+| `--peak-threshold P`     | `32`         | also re-send a tile when any pixel changed by more than P (`0` = off); fixes ghost specks |
+| `--format tjc2\|tjc3\|tjc4` | automatic | stream format; automatic = the oldest one the options need |
+| `--quadtree`             |              | TJC4 variable tile size: `--tile-size 64 --split-levels 3` |
+| `--split-levels N`       | `0`          | TJC4 quadtree depth 0..4 (square tiles, smallest leaf even and >= 8) |
+| `--bitrate RATE`         | off          | average target, audio included: `800k`, `2.5M`, `1500` (kbit/s); TJC4 by default |
+| `--maxrate RATE`         | off          | hard cap over any `--bufsize` window |
+| `--bufsize MS`           | `1000`       | cap window |
+| `--min-quality Q`        | `10`         | lowest quality `--bitrate` may use (`--maxrate` may go lower) |
 
 ### Choosing a tile size
 
@@ -341,39 +450,59 @@ two framebuffers never drift apart. Decoder RAM is the padded frame (1.5 bytes p
 pixel), a second frame of the same size for motion compensated streams only (1.4 MB
 at 720p, 3.1 MB at 1080p), one tile payload buffer, and one frame's worth of audio.
 
-Seeking: `tjc::SyncTracker` follows what every tile's content depends on and gives,
-for any frame, the frame to start decoding from to reproduce it exactly. Feed it
-`Decoder::decode_frame(..., apply=false)` + `tile_info()` while indexing. Before
-decoding from that frame, also load the Huffman tables in force there: parse the last
-frame at or before it with `FrameStats::tables` set (again with `apply=false`).
-TJC Studio does exactly this.
+TJC4 settings live in `Config`: `split_levels`, `bitrate_kbps`, `max_bitrate_kbps`,
+`buffer_ms`, `min_quality` and `format`. `peak_threshold` works with every format.
+`FrameStats` reports each frame's `quality`, quadtree `leaves` and the
+`deferred_tiles` held back by the cap.
 
-## Stream format (TJC3)
+Seeking: `tjc::SyncTracker` follows what every tile's content depends on and gives,
+for any frame, the frame to start decoding from to reproduce it exactly. While
+indexing, feed it `Decoder::decode_frame(..., apply=false)` and
+`unit_layout()`/`unit_info()`: the quadtree leaves for TJC4, the tiles otherwise.
+Before decoding from that frame, load the Huffman tables in force there. Parse the
+last frame at or before it that has `FrameStats::tables` set (again with
+`apply=false`), or call `reset_tables()` if there is none. TJC Studio does exactly
+this.
+
+## Stream format (TJC4)
 
 Multi-byte fields are little-endian (see `TJC_STREAM_BIG_ENDIAN`), except inside
 the QOA frames, which keep QOA's own big-endian layout.
 
 ```
 Stream header, 34 bytes
-  magic "TJC3" (4) | width (2) | height (2) | tile_w (1) | tile_h (1)
+  magic "TJC4" (4) | width (2) | height (2) | tile_w (1) | tile_h (1)
   chroma_format (1, 0 = 4:2:0) | refresh_mode (1) | refresh_param (2)
-  quality (1) | reserved (3, zero)
+  quality (1, the highest any frame uses) | reserved (3, zero)
   fps_num (4) | fps_den (4)
   audio_codec (1, 0 = none, 1 = QOA) | audio_channels (1) | audio_rate (4)
-  flags (1: bit0 adaptive Huffman, bit1 motion compensation) | reserved (1, zero)
+  flags (1: bit0 adaptive Huffman, bit1 motion compensation)
+  split_levels (1: quadtree depth 0..4; TJC3: reserved, zero)
 
 Frame
   frame_num (4) | flags (1: bit0 force refresh, bit1 tables follow)
+  quality (1, 1..100: this frame's quant tables)  [TJC4 only]
   tables, if flags bit1: 4 x (16 code-length counts + symbols), JPEG DHT layout;
       DC luma, AC luma, DC chroma, AC chroma; in force until replaced
   dirty_bitmap, ceil(tiles/8) bytes, only if force refresh is not set
       tile i (raster order) = bit (i & 7) of byte (i >> 3)
-  per dirty tile: tile_len (2) | payload (tile_len)
+  per dirty tile: tile_len | payload (tile_len)
+      tile_len: TJC4 LEB128 varint (1-3 bytes, low 7 bits first); TJC3: 2 bytes
   if audio_codec != 0: audio_len (4) | QOA frames (audio_len bytes)
       standard QOA frames of up to 5120 samples per channel, holding the samples
       that play during this video frame
 
-Tile payload
+TJC4 tile payload: a quadtree
+  node above the deepest level: split (1 bit); 1 = four children follow
+      (top-left, top-right, bottom-left, bottom-right)
+  leaf: mode, except in force refresh frames (all intra)
+      with motion: '0' inter, '10' intra, '11' skip (keep the picture)
+      without motion: '0' intra, '1' skip
+  intra / inter leaves are coded like a TJC3 tile (below) over the leaf's area;
+  the vector predictor is the last inter leaf's vector in the same tile row,
+  (0, 0) at the start of each row. With split_levels 0 a tile is one leaf.
+
+TJC3 tile payload
   [motion streams only] mode (1 bit): 0 intra, 1 inter;
       inter: mvx, mvy (signed Exp-Golomb, half-pels, minus the previous coded tile's
       vector in the same tile row if it was inter), residual flag (1 bit)
@@ -402,3 +531,5 @@ Changes from the original plan:
   frame rate in the stream (TJC2).
 - TJC3 adds motion compensation and adaptive Huffman tables; the plan's static
   tables and intra-only tiles remain available as `--format tjc2`.
+- TJC4 adds the quadtree (variable tile size), a quality per frame for rate
+  control, and varint tile lengths (so tiles up to 255x255 are allowed).
