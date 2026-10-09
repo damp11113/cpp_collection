@@ -43,6 +43,7 @@ struct EncodeProgress {
     uint64_t bytes = 0, audio_bytes = 0;
     double elapsed = 0;
     double dirty_percent = 0;
+    double inter_percent = 0;  // of the sent tiles, motion compensated
     uint64_t audio_padded = 0, audio_extra = 0;
     std::string message;
 };

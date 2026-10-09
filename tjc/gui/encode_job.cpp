@@ -208,7 +208,7 @@ void EncodeJob::run() {
     std::vector<int16_t> pcm;
     enc.write_stream_header(buf);
     bool write_ok = std::fwrite(buf.data(), 1, buf.size(), out) == buf.size();
-    uint64_t bytes = buf.size(), audio_bytes = 0, dirty = 0, tiles = 0, padded = 0;
+    uint64_t bytes = buf.size(), audio_bytes = 0, dirty = 0, tiles = 0, padded = 0, inter = 0;
     bool audio_eof = false;
     auto last_preview = clock::now() - std::chrono::seconds(1);
     set_message("encoding");
@@ -239,6 +239,7 @@ void EncodeJob::run() {
         bytes += buf.size();
         audio_bytes += st.audio_bytes;
         dirty += st.dirty_tiles;
+        inter += st.inter_tiles;
         tiles += st.total_tiles;
         padded += st.audio_padded;
 
@@ -257,6 +258,7 @@ void EncodeJob::run() {
         p_.bytes = bytes;
         p_.audio_bytes = audio_bytes;
         p_.dirty_percent = tiles ? 100.0 * double(dirty) / double(tiles) : 0;
+        p_.inter_percent = dirty ? 100.0 * double(inter) / double(dirty) : 0;
         p_.audio_padded = padded;
         p_.elapsed = std::chrono::duration<double>(now - t0).count();
         if (want_preview) {

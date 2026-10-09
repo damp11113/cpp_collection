@@ -75,6 +75,7 @@ bool Player::open(const std::string& path, std::string* err) {
         std::lock_guard<std::mutex> lk(index_mu_);
         offsets_.clear();
         sync_.clear();
+        tables_.clear();
         sizes_.clear();
         index_bytes_ = 0;
         index_done_ = false;
@@ -193,14 +194,12 @@ void Player::index_main() {
         if (f) std::fclose(f);
         return;
     }
-    const size_t tiles = size_t(layout_.tiles);
     uint64_t off = header_.version == 1 ? tjc::kStreamHeaderSizeV1 : tjc::kStreamHeaderSize;
-    // last[t] = frame tile t was last sent in; count[f] = tiles whose last send is
-    // frame f. The smallest f with count[f] > 0 is the sync point. It only moves
-    // forward, so keeping it costs O(dirty tiles) per frame.
-    std::vector<uint32_t> last(tiles, 0);
-    std::vector<uint32_t> count(1, uint32_t(tiles));
-    uint32_t min_frame = 0;
+    // The tracker follows what each tile's content depends on (motion vectors
+    // included) and gives the frame a seek has to start decoding from.
+    tjc::SyncTracker tracker;
+    tracker.reset(layout_);
+    int64_t last_tables = -1;
     for (uint32_t frame = 0; !stop_; ++frame) {
         tjc::FrameStats fs;
         tjc::Status st = dec.decode_frame(file_read, f, &fs, false);
@@ -211,19 +210,13 @@ void Player::index_main() {
                            tjc::status_string(st);
             break;
         }
-        if (count.size() < size_t(frame) + 1) count.resize(size_t(frame) + 1, 0);
-        const uint8_t* dirty = dec.dirty_flags();
-        for (size_t t = 0; t < tiles; ++t) {
-            if (!dirty[t]) continue;
-            --count[last[t]];
-            last[t] = frame;
-            ++count[frame];
-        }
-        while (count[min_frame] == 0) ++min_frame;
+        uint32_t sync = tracker.add_frame(frame, dec.tile_info());
+        if (fs.tables) last_tables = frame;
         {
             std::lock_guard<std::mutex> lk(index_mu_);
             offsets_.push_back(off);
-            sync_.push_back(min_frame);
+            sync_.push_back(sync);
+            tables_.push_back(int32_t(last_tables));
             sizes_.push_back(uint32_t(fs.bytes));
             index_bytes_ = off + fs.bytes;
         }
@@ -262,7 +255,11 @@ bool Player::decode_one() {
     dec_.copy_frame(yuv_.data());
     f.rgba.resize(size_t(layout_.width) * size_t(layout_.height) * 4);
     yuv420_to_rgba(yuv_.data(), layout_.width, layout_.height, ColorMatrix(matrix_.load()), f.rgba.data());
-    f.dirty.assign(dec_.dirty_flags(), dec_.dirty_flags() + layout_.tiles);
+    // Per tile: 0 = unchanged, 1 = intra, 2 = motion compensated, 3 = full refresh.
+    f.dirty.resize(size_t(layout_.tiles));
+    const tjc::TileInfo* info = dec_.tile_info();
+    for (int t = 0; t < layout_.tiles; ++t)
+        f.dirty[size_t(t)] = f.stats.force_refresh && info[t].mode ? 3 : info[t].mode;
 
     if (audio_.is_open() && dec_.audio_samples()) {
         const int16_t* a = dec_.audio();
@@ -295,14 +292,24 @@ void Player::do_seek(uint32_t target, uint64_t gen) {
         decode_error_.clear();
     }
     audio_.clear();
-    uint64_t off;
+    uint64_t off, tables_off = 0;
     uint32_t start;
+    bool need_tables = false;
     {
         std::lock_guard<std::mutex> lk(index_mu_);
         if (offsets_.empty()) return;
         target = std::min<uint32_t>(target, uint32_t(offsets_.size() - 1));
         start = sync_[target];
         off = offsets_[start];
+        int32_t tf = tables_[start];
+        if (tf >= 0 && uint32_t(tf) < start) {  // Huffman tables in force at the start frame
+            need_tables = true;
+            tables_off = offsets_[size_t(tf)];
+        }
+    }
+    if (need_tables) {
+        if (!seek64(dfile_, tables_off)) return;
+        dec_.decode_frame(file_read, dfile_, nullptr, false);
     }
     if (!seek64(dfile_, off)) return;
     // Bring every tile up to date; only the target frame is shown.

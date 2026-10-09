@@ -1,17 +1,57 @@
 # TJC — Tiled-JPEG Codec
 
-A small intra-only video codec for low-power decoders (written with a single-core
-MIPS 24KEc in mind). Each frame is split into tiles; only tiles that changed (plus
-tiles picked by a refresh policy) are sent, each as a tiny baseline-JPEG-style blob.
-The decoder keeps a persistent framebuffer and patches it. An optional audio track
-is coded with [QOA](https://qoaformat.org) and interleaved per video frame, so audio
-and video stay in sync by construction.
+A small video codec for low-power decoders (written with a single-core MIPS 24KEc in
+mind: integer-only, no FPU needed). Each frame is split into tiles; only tiles that
+changed (plus tiles picked by a refresh policy) are sent, each as a tiny
+baseline-JPEG-style blob or, in TJC3, as a motion-compensated copy of the previous
+frame plus a small correction. The decoder keeps a persistent framebuffer and
+patches it. An optional audio track is coded with [QOA](https://qoaformat.org) and
+interleaved per video frame, so audio and video stay in sync by construction.
+
+## Compression tools (TJC3)
+
+| Tool | What it does | Format | Decoder cost |
+|------|--------------|--------|--------------|
+| Motion compensation (`--motion`, default on) | A dirty tile can be "the previous frame at offset (dx, dy), half-pel precision, plus a coded correction" | TJC3 | +1 frame of RAM; a block copy and an add per moving tile |
+| Adaptive Huffman tables (`--huffman`, default adaptive) | Entropy tables fitted to the video, sent only when they pay off | TJC3 | builds a table when one arrives (~2 KB) |
+| Deadzone quantization (`--deadzone`, default 0.33) | Small coefficients round to zero | any | none |
+| Smart rolling refresh (`--smart-refresh`, default on) | Refresh skips tiles whose content is recent | any | none |
+| Skip invisible updates (`--skip-invisible T`, default off) | Drops updates nobody could see (grain) | any | none; static areas keep their last grain |
+
+Bytes needed for the same picture quality (BD-rate on PSNR), compared with the
+previous release, on 720p test clips:
+
+| Clip | `--format tjc2` | **TJC3** | TJC3 + `--skip-invisible 2` |
+|------|-----------------|----------|-----------------------------|
+| Screen content | -3.7% | **-65%** | -65% |
+| Motion graphics | -5.0% | **-33%** | -33% |
+| Noisy camera | -8.5% | **-35%** | **-51%** |
+| Zoom | -3.4% | **-40%** | -40% |
+| Camera pan | -3.2% | **-83%** | -83% |
+| Noisy pan | -6.2% | **-71%** | **-76%** |
+
+`--format tjc2` turns motion compensation and adaptive tables off: the file then
+plays on TJC2 decoders. New decoders play TJC1, TJC2 and TJC3.
+
+Decoding TJC3 is about as fast as TJC2 (faster on high-motion clips, since there are
+fewer bits to unpack; ~25% slower in the worst case measured). A size-optimized
+decoder-only build (`-Os`, `TJC_NO_ENCODER`) is about 21 KB of x86-64 code including
+motion compensation and QOA audio.
+
+Encoding TJC3 costs more than TJC2: the motion search. `--effort` picks the trade-off
+(it never changes the format); at 720p on 4 threads:
+
+| Effort | Noisy clip | Size vs `best` |
+|--------|------------|----------------|
+| `fast` | 42 fps | up to +9% |
+| `normal` (default) | 37 fps | within ~0.5% (2% on motion graphics) |
+| `best` | 23 fps | — |
 
 | File          | What                                                              |
 |---------------|-------------------------------------------------------------------|
 | `tjc.h`       | single-header library: encoder + decoder (stb-style)              |
 | `tjc.cpp`     | `tjc` command line tool: `encode`, `decode`, `info`               |
-| `tjc_test.cpp`| unit tests (bitstream, DCT, Huffman, bitmap, SAD, refresh, QOA, seeking) + end-to-end |
+| `tjc_test.cpp`| unit tests (DCT, Huffman, motion, seeking, QOA, fuzzing, ...) + end-to-end |
 | `gui/`        | **TJC Studio**: desktop player + encoder for Windows and Linux/X11 |
 
 ## Build
@@ -40,7 +80,8 @@ all three when you configure the build.
   screen. Seeking decodes from there, so the picture is bit-identical to playing
   from the start without decoding the whole file. That's one refresh cycle for
   rolling streams, back to the last full refresh for periodic ones.
-- Tile overlay (`T`): red = tiles this frame updated, blue = full refresh.
+- Tile overlay (`T`): red = tile coded from scratch, green = motion compensated,
+  blue = full refresh.
 - Info panel: stream settings, per-frame tiles/bytes/audio, the frame each seek
   restarts from, and a frame-size graph.
 - Loop, volume, BT.601/BT.709 color matrix, click the picture to play/pause.
@@ -50,6 +91,8 @@ all three when you configure the build.
 - Output size presets (source/1080p/720p/480p/360p/custom), frame rate, tile size,
   quality, motion threshold, refresh mode, keyframes, threads, audio on/off with
   resampling (rate, stereo/mono).
+- Compression: motion compensation, adaptive Huffman tables, "TJC2 compatible",
+  effort (fast/normal/best) and skip-invisible.
 - Progress, speed, ETA, bitrate, a live preview of what the decoder will show,
   Cancel (deletes the partial file), and "Play output".
 - Produces the same bytes as `tjc encode` with the same settings.
@@ -211,6 +254,15 @@ inside a `.tjc` are standard QOA frames.
 | `--diff-ref`             | `last-coded` | what the new frame is compared to: `last-coded` source pixels or `recon` (decoded pixels) |
 | `--keyframe-every N`     | `0`          | additionally force a full refresh every N frames |
 | `--threads N`            | `0`          | encoder threads, `0` = all cores. The output is identical for any value |
+| `--motion on\|off`        | `on`         | motion compensation (TJC3) |
+| `--huffman adaptive\|standard` | `adaptive` | Huffman tables fitted to the video (TJC3) |
+| `--format tjc2`          |              | both of the above off: plays on TJC2 decoders |
+| `--effort fast\|normal\|best` | `normal` | encoder speed vs size |
+| `--deadzone X`           | `0.33`       | AC rounding point, 0..0.5 (0.5 = plain rounding) |
+| `--smart-refresh on\|off` | `on`         | rolling refresh skips recently sent tiles |
+| `--skip-invisible T`     | `0` (off)    | drop updates that change no 8x8 block by more than T per pixel; 1-2 for grainy video |
+| `--motion-range N`       | `32`         | motion search range in pixels |
+| `--sync-window N`        | automatic    | how many frames back a decoder may have to go to seek or join |
 
 ### Choosing a tile size
 
@@ -277,7 +329,8 @@ while (dec.decode_frame(rd, stdin) == tjc::Status::Ok) {
 
 Compile-time switches (define before the implementation include):
 
-- `TJC_NO_ENCODER`: decoder only (video + audio). About 24 KB of code on x86-64 at `-O2`.
+- `TJC_NO_ENCODER`: decoder only (video, motion compensation, audio): about 21 KB of
+  x86-64 code with `-Os -ffunction-sections -Wl,--gc-sections`, 41 KB at `-O2`.
 - `TJC_STREAM_BIG_ENDIAN 1`: big-endian multi-byte stream fields.
 - `TJC_MAX_PIXELS n`: largest `width*height` the decoder will accept.
 - `TJC_NO_THREADS`: single-threaded encoder with no `<thread>` dependency.
@@ -285,25 +338,35 @@ Compile-time switches (define before the implementation include):
 The decode path is integer-only (IJG "islow" DCT) and deterministic: decoder output
 is bit-identical to the encoder's internal reconstruction on every platform, so the
 two framebuffers never drift apart. Decoder RAM is the padded frame (1.5 bytes per
-pixel), one tile payload buffer, and one frame's worth of audio samples.
+pixel), a second frame of the same size for motion compensated streams only (1.4 MB
+at 720p, 3.1 MB at 1080p), one tile payload buffer, and one frame's worth of audio.
 
-## Stream format (TJC2)
+Seeking: `tjc::SyncTracker` follows what every tile's content depends on and gives,
+for any frame, the frame to start decoding from to reproduce it exactly. Feed it
+`Decoder::decode_frame(..., apply=false)` + `tile_info()` while indexing. Before
+decoding from that frame, also load the Huffman tables in force there: parse the last
+frame at or before it with `FrameStats::tables` set (again with `apply=false`).
+TJC Studio does exactly this.
+
+## Stream format (TJC3)
 
 Multi-byte fields are little-endian (see `TJC_STREAM_BIG_ENDIAN`), except inside
 the QOA frames, which keep QOA's own big-endian layout.
 
 ```
 Stream header, 34 bytes
-  magic "TJC2" (4) | width (2) | height (2) | tile_w (1) | tile_h (1)
+  magic "TJC3" (4) | width (2) | height (2) | tile_w (1) | tile_h (1)
   chroma_format (1, 0 = 4:2:0) | refresh_mode (1) | refresh_param (2)
   quality (1) | reserved (3, zero)
   fps_num (4) | fps_den (4)
   audio_codec (1, 0 = none, 1 = QOA) | audio_channels (1) | audio_rate (4)
-  reserved (2, zero)
+  flags (1: bit0 adaptive Huffman, bit1 motion compensation) | reserved (1, zero)
 
 Frame
-  frame_num (4) | force_refresh (1)
-  dirty_bitmap, ceil(tiles/8) bytes, only if force_refresh == 0
+  frame_num (4) | flags (1: bit0 force refresh, bit1 tables follow)
+  tables, if flags bit1: 4 x (16 code-length counts + symbols), JPEG DHT layout;
+      DC luma, AC luma, DC chroma, AC chroma; in force until replaced
+  dirty_bitmap, ceil(tiles/8) bytes, only if force refresh is not set
       tile i (raster order) = bit (i & 7) of byte (i >> 3)
   per dirty tile: tile_len (2) | payload (tile_len)
   if audio_codec != 0: audio_len (4) | QOA frames (audio_len bytes)
@@ -311,13 +374,18 @@ Frame
       that play during this video frame
 
 Tile payload
-  Huffman-coded 8x8 blocks (standard JPEG Annex K tables), MSB first, zero-padded,
-  no 0xFF stuffing. Order: Y blocks, then Cb, then Cr, raster within the tile.
-  The DC predictor resets per component per tile, so each tile decodes on its own.
+  [motion streams only] mode (1 bit): 0 intra, 1 inter;
+      inter: mvx, mvy (signed Exp-Golomb, half-pels, minus the previous coded tile's
+      vector in the same tile row if it was inter), residual flag (1 bit)
+  Huffman-coded 8x8 blocks, MSB first, zero-padded, no 0xFF stuffing. Order: Y
+  blocks, then Cb, then Cr, raster within the tile. The DC predictor resets per
+  component per tile. Inter blocks are residuals added to the prediction (previous
+  frame moved by the vector, half-pel averaging; chroma vector = luma >> 1).
 ```
 
-TJC1 streams (the first 18 header bytes with magic `TJC1`, no frame rate, no audio)
-still decode; they are treated as 30 fps.
+TJC2 is the same without the header flags, frame tables and tile mode bits (always
+standard tables, always intra). TJC1 streams (the first 18 header bytes with magic
+`TJC1`, no frame rate, no audio) still decode; they are treated as 30 fps.
 
 Changes from the original plan:
 
@@ -332,3 +400,5 @@ Changes from the original plan:
   tile, so a small object moving inside a large tile is still detected.
 - Audio, a v1 non-goal, is now supported (QOA, per-frame interleave), along with a
   frame rate in the stream (TJC2).
+- TJC3 adds motion compensation and adaptive Huffman tables; the plan's static
+  tables and intra-only tiles remain available as `--format tjc2`.

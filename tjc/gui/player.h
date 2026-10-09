@@ -26,7 +26,7 @@ struct VideoFrame {
     double pts = 0;
     uint64_t generation = 0;
     std::vector<uint8_t> rgba;   // width * height * 4
-    std::vector<uint8_t> dirty;  // one flag per tile
+    std::vector<uint8_t> dirty;  // per tile: 0 unchanged, 1 intra, 2 motion, 3 full refresh
     tjc::FrameStats stats;
 };
 
@@ -95,6 +95,7 @@ private:
     mutable std::mutex index_mu_;
     std::vector<uint64_t> offsets_;
     std::vector<uint32_t> sync_, sizes_;
+    std::vector<int32_t> tables_;  // last frame <= f that carried Huffman tables (-1: none)
     uint64_t index_bytes_ = 0;
     bool index_done_ = false;
     std::string index_error_;

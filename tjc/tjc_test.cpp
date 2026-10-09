@@ -10,6 +10,7 @@
 #include <cstring>
 #include <algorithm>
 #include <set>
+#include <string>
 #include <vector>
 
 static int g_failed = 0;
@@ -311,9 +312,23 @@ static void test_header() {
     h.audio_codec = 1;
     h.audio_channels = 2;
     h.audio_rate = 48000;
+    h.version = 2;
     uint8_t buf[kStreamHeaderSize];
     write_stream_header(h, buf);
     CHECK(std::memcmp(buf, "TJC2", 4) == 0);
+    {
+        StreamHeader h3 = h;
+        h3.version = 3;
+        h3.flags = kFlagMotion | kFlagAdaptiveHuffman;
+        uint8_t b3[kStreamHeaderSize];
+        write_stream_header(h3, b3);
+        StreamHeader r3;
+        CHECK(std::memcmp(b3, "TJC3", 4) == 0);
+        CHECK(parse_stream_header(b3, kStreamHeaderSize, &r3) == Status::Ok);
+        CHECK(r3.version == 3 && r3.flags == (kFlagMotion | kFlagAdaptiveHuffman) && r3.fps_num == 30000);
+        b3[32] = 0x80;  // unknown flag
+        CHECK(parse_stream_header(b3, kStreamHeaderSize, &r3) == Status::BadHeader);
+    }
 #if !TJC_STREAM_BIG_ENDIAN
     CHECK(buf[4] == (1918 & 255) && buf[5] == (1918 >> 8));
 #endif
@@ -636,6 +651,8 @@ static void test_tjc1_compat() {
     Config cfg;
     cfg.width = 80;
     cfg.height = 48;
+    cfg.motion = false;
+    cfg.adaptive_huffman = false;
     Encoder enc;
     CHECK(enc.init(cfg));
     std::vector<uint8_t> v2, f;
@@ -669,10 +686,11 @@ static void test_tjc1_compat() {
 // Exact seeking as TJC Studio does it: a parse-only pass (apply = false) records
 // per frame the oldest "last sent" frame over all tiles; decoding from there
 // must reproduce frame T exactly.
-static void test_seek_sync(RefreshMode mode, uint32_t param, uint32_t keyframe_every, int tile) {
+static void test_seek_sync(RefreshMode mode, uint32_t param, uint32_t keyframe_every, int tile, bool motion = true) {
     Config cfg;
     cfg.width = 96;
     cfg.height = 64;
+    cfg.motion = motion;
     cfg.tile_w = cfg.tile_h = uint8_t(tile);
     cfg.refresh_mode = mode;
     cfg.refresh_param = param;
@@ -711,12 +729,16 @@ static void test_seek_sync(RefreshMode mode, uint32_t param, uint32_t keyframe_e
     // Index pass without decoding.
     std::vector<size_t> offsets;
     std::vector<uint32_t> sync;
+    std::vector<int> tables_at;  // last frame <= t that carried Huffman tables
     {
         MemoryReader mr{stream.data(), stream.size(), 0};
         Decoder d;
         CHECK(d.read_header(MemoryReader::read, &mr) == Status::Ok);
         const size_t tiles = size_t(d.layout().tiles);
-        std::vector<uint32_t> last(tiles, 0);
+        (void)tiles;
+        SyncTracker tracker;
+        tracker.reset(d.layout());
+        int last_tables = -1;
         std::vector<uint8_t> before(frame_size(96, 64)), after(before.size());
         d.copy_frame(before.data());
         FrameStats st;
@@ -726,10 +748,10 @@ static void test_seek_sync(RefreshMode mode, uint32_t param, uint32_t keyframe_e
             if (d.decode_frame(MemoryReader::read, &mr, &st, false) != Status::Ok) break;
             stats_match &= st.bytes == ref_stats[t].bytes && st.dirty_tiles == ref_stats[t].dirty_tiles &&
                            st.audio_bytes == ref_stats[t].audio_bytes && d.audio_samples() == 0;
-            for (size_t i = 0; i < tiles; ++i)
-                if (d.dirty_flags()[i]) last[i] = t;
+            if (st.tables) last_tables = int(t);
             offsets.push_back(off);
-            sync.push_back(*std::min_element(last.begin(), last.end()));
+            sync.push_back(tracker.add_frame(t, d.tile_info()));
+            tables_at.push_back(last_tables);
         }
         d.copy_frame(after.data());
         CHECK(stats_match);
@@ -742,16 +764,22 @@ static void test_seek_sync(RefreshMode mode, uint32_t param, uint32_t keyframe_e
         MemoryReader mr{stream.data(), stream.size(), 0};
         Decoder d;
         d.read_header(MemoryReader::read, &mr);
-        mr.pos = offsets[size_t(sync[size_t(t)])];
+        uint32_t s0 = sync[size_t(t)];
+        int tf = tables_at[size_t(s0)];
+        if (tf >= 0 && uint32_t(tf) < s0) {  // load the tables in force at the start frame
+            mr.pos = offsets[size_t(tf)];
+            d.decode_frame(MemoryReader::read, &mr, nullptr, false);
+        }
+        mr.pos = offsets[size_t(s0)];
         for (int k = int(sync[size_t(t)]); k <= t; ++k, ++decoded) d.decode_frame(MemoryReader::read, &mr);
         std::vector<uint8_t> out(frame_size(96, 64));
         d.copy_frame(out.data());
         exact &= out == ref[size_t(t)];
     }
     CHECK(exact);
-    std::printf("  %-8s param %-3u keyframe %-3u tile %-2d: avg %.1f frames decoded per seek\n",
+    std::printf("  %-8s param %-3u keyframe %-3u tile %-2d motion %d: avg %.1f frames decoded per seek\n",
                 mode == RefreshMode::None ? "none" : mode == RefreshMode::Rolling ? "rolling" : "periodic", param,
-                keyframe_every, tile, double(decoded) / frames);
+                keyframe_every, tile, int(motion), double(decoded) / frames);
 }
 
 static void test_seeking() {
@@ -761,6 +789,243 @@ static void test_seeking() {
     test_seek_sync(RefreshMode::FullPeriodic, 10, 0, 16);
     test_seek_sync(RefreshMode::None, 0, 0, 16);
     test_seek_sync(RefreshMode::None, 0, 15, 7);
+    test_seek_sync(RefreshMode::Rolling, 4, 0, 16, false);
+    test_seek_sync(RefreshMode::Rolling, 6, 0, 13);
+}
+
+// --- TJC3 -------------------------------------------------------------------
+
+static void test_optimal_huffman() {
+    std::printf("optimal Huffman tables\n");
+    bool ok = true;
+    for (int iter = 0; iter < 400; ++iter) {
+        uint32_t f[256] = {};
+        int kind = iter % 4;
+        for (int i = 0; i < 256; ++i) {
+            if (kind == 0) f[i] = rnd() % 1000;                        // random
+            else if (kind == 1) f[i] = (rnd() % 8 == 0) ? rnd() % 50 : 0; // sparse
+            else if (kind == 2) f[i] = i < 40 ? (1u << (i % 30)) : 0;   // forces the 16-bit limit
+            else f[i] = i == int(rnd() % 256) ? 1000 : 0;               // a single symbol
+        }
+        detail::HuffSet hs;
+        for (int t = 0; t < 4; ++t) hs.spec[t] = detail::optimal_huff(f);
+        bool any = false;
+        for (uint32_t v : f) any |= v != 0;
+        if (!any) continue;
+        ok &= hs.build();
+        int maxlen = 0;
+        for (int sym = 0; sym < 256; ++sym) {
+            ok &= (f[sym] != 0) == (hs.enc[0].size[sym] != 0);
+            maxlen = std::max(maxlen, int(hs.enc[0].size[sym]));
+        }
+        ok &= maxlen <= 16;
+        // Every code decodes back to its symbol.
+        for (int sym = 0; sym < 256 && ok; ++sym) {
+            if (!f[sym]) continue;
+            std::vector<uint8_t> buf;
+            detail::BitWriter bw(buf);
+            bw.put(hs.enc[0].code[sym], hs.enc[0].size[sym]);
+            bw.put(0xffff, 16);
+            bw.flush();
+            detail::BitReader br(buf.data(), buf.size());
+            ok &= detail::huff_decode(br, hs.dec[0]) == sym;
+        }
+    }
+    CHECK(ok);
+    // Malformed tables are refused.
+    detail::HuffSet bad = detail::standard_huff();
+    bad.spec[1].bits[0] = 3;  // three 1-bit codes
+    CHECK(!bad.build());
+    bad = detail::standard_huff();
+    bad.spec[0].vals[1] = bad.spec[0].vals[0];  // duplicate symbol
+    CHECK(!bad.build());
+}
+
+static void test_exp_golomb() {
+    std::printf("exp-golomb\n");
+    std::vector<uint8_t> buf;
+    detail::BitWriter bw(buf);
+    std::vector<int> vals;
+    for (int v = -3000; v <= 3000; v += 7) vals.push_back(v);
+    vals.push_back(0);
+    vals.push_back(65535);
+    vals.push_back(-65536);
+    size_t bits = 0;
+    for (int v : vals) {
+        detail::put_se(bw, v);
+        bits += size_t(detail::se_bits(v));
+    }
+    bw.flush();
+    CHECK(buf.size() == (bits + 7) / 8);
+    detail::BitReader br(buf.data(), buf.size());
+    bool ok = true;
+    for (int v : vals) {
+        int got = 0;
+        ok &= detail::get_se(br, &got) && got == v;
+    }
+    CHECK(ok);
+    std::vector<uint8_t> zeros(16, 0);
+    detail::BitReader bz(zeros.data(), zeros.size());
+    int dummy;
+    CHECK(!detail::get_se(bz, &dummy));  // runaway prefix is rejected
+}
+
+static void test_predict_block() {
+    std::printf("half-pel prediction\n");
+    std::vector<uint8_t> plane(40 * 40);
+    for (auto& p : plane) p = uint8_t(rnd());
+    bool ok = true;
+    for (int mvy = -6; mvy <= 6; ++mvy)
+        for (int mvx = -6; mvx <= 6; ++mvx) {
+            uint8_t out[64];
+            detail::predict_block(plane.data(), 40, 16, 16, mvx, mvy, 8, 8, out, 8);
+            for (int y = 0; y < 8; ++y)
+                for (int x = 0; x < 8; ++x) {
+                    int sx = 16 + x + (mvx >> 1), sy = 16 + y + (mvy >> 1), fx = mvx & 1, fy = mvy & 1;
+                    auto P = [&](int a, int b) { return int(plane[size_t(b) * 40 + size_t(a)]); };
+                    int e = !fx && !fy ? P(sx, sy)
+                            : fx && !fy ? (P(sx, sy) + P(sx + 1, sy) + 1) >> 1
+                            : !fx       ? (P(sx, sy) + P(sx, sy + 1) + 1) >> 1
+                                        : (P(sx, sy) + P(sx + 1, sy) + P(sx, sy + 1) + P(sx + 1, sy + 1) + 2) >> 2;
+                    ok &= out[y * 8 + x] == e;
+                }
+        }
+    CHECK(ok);
+}
+
+// Smooth texture panning by `speed` half-pels per frame (sub-pixel motion).
+static void make_pan(std::vector<uint8_t>& f, int w, int h, int t, int speed, bool noise) {
+    int cw = (w + 1) / 2, ch = (h + 1) / 2;
+    f.resize(frame_size(w, h));
+    double ox = t * speed * 0.5;
+    for (int j = 0; j < h; ++j)
+        for (int i = 0; i < w; ++i) {
+            double x = i + ox;
+            double v = 128 + 55 * std::sin(x * 0.21) * std::cos(j * 0.13) + 40 * std::sin((x * 0.05 + j * 0.07) * 3);
+            if (noise) v += double(int(rnd() % 9) - 4);
+            f[size_t(j) * w + i] = uint8_t(std::max(0.0, std::min(255.0, v)));
+        }
+    uint8_t* u = f.data() + size_t(w) * h;
+    uint8_t* v = u + size_t(cw) * ch;
+    for (int j = 0; j < ch; ++j)
+        for (int i = 0; i < cw; ++i) {
+            double x = 2 * i + ox;
+            u[size_t(j) * cw + i] = uint8_t(128 + 40 * std::sin(x * 0.03));
+            v[size_t(j) * cw + i] = uint8_t(128 + 40 * std::cos(x * 0.04 + j * 0.05));
+        }
+}
+
+struct RunResult {
+    std::vector<uint8_t> stream;
+    bool exact = true;
+    double min_psnr = 99;
+    uint64_t inter = 0, dropped = 0, tables = 0;
+};
+
+static RunResult run_tjc3(Config cfg, int frames, int speed, bool noise, bool box = false) {
+    RunResult r;
+    Encoder enc;
+    CHECK(enc.init(cfg));
+    enc.write_stream_header(r.stream);
+    std::vector<std::vector<uint8_t>> src, rec;
+    g_rng = 777;  // same noise for every configuration
+    for (int t = 0; t < frames; ++t) {
+        std::vector<uint8_t> f;
+        if (box) make_frame(f, cfg.width, cfg.height, t);
+        else make_pan(f, cfg.width, cfg.height, t, speed, noise);
+        FrameStats st;
+        enc.encode_frame(f.data(), r.stream, &st);
+        r.inter += st.inter_tiles;
+        r.dropped += st.dropped_tiles;
+        r.tables += st.tables;
+        rec.emplace_back(f.size());
+        enc.copy_recon(rec.back().data());
+        src.push_back(std::move(f));
+    }
+    MemoryReader mr{r.stream.data(), r.stream.size(), 0};
+    Decoder d;
+    CHECK(d.read_header(MemoryReader::read, &mr) == Status::Ok);
+    std::vector<uint8_t> out(frame_size(cfg.width, cfg.height));
+    int n = 0;
+    FrameStats st;
+    while (d.decode_frame(MemoryReader::read, &mr, &st) == Status::Ok) {
+        d.copy_frame(out.data());
+        r.exact &= out == rec[size_t(n)];
+        r.min_psnr = std::min(r.min_psnr, psnr(out, src[size_t(n)]));
+        ++n;
+    }
+    CHECK(n == frames);
+    return r;
+}
+
+static void test_tjc3_pipeline() {
+    std::printf("TJC3: motion compensation, adaptive Huffman, skip-invisible\n");
+    // Small frames have few tiles, so the rolling refresh is kept slow (refresh_param)
+    // or it would force most tiles to intra and hide what motion compensation does.
+    struct Case { const char* name; int w, h, tile, speed; bool noise, motion, huff; double skip; uint32_t refresh; };
+    const Case cases[] = {
+        {"pan 1.5px/frame", 160, 96, 16, 3, false, true, true, 0, 2},
+        {"pan, no motion comp.", 160, 96, 16, 3, false, false, true, 0, 2},
+        {"pan, standard tables", 160, 96, 16, 3, false, true, false, 0, 2},
+        {"TJC2 (both off)", 160, 96, 16, 3, false, false, false, 0, 2},
+        {"static noise + skip", 160, 96, 16, 0, true, true, true, 2.0, 2},
+        {"static noise, no skip", 160, 96, 16, 0, true, true, true, 0, 2},
+        {"odd tiles 13x9", 131, 77, 13, 5, false, true, true, 0, 2},
+        {"tiles 7x5 + skip", 97, 61, 7, 0, true, true, true, 1.0, 4},
+        {"fast pan 9.5px", 160, 96, 32, 19, false, true, true, 0, 1},
+        {"default refresh", 160, 96, 16, 3, false, true, true, 0, 30},
+    };
+    size_t with_mc = 0, without_mc = 0, std_tables = 0, skip_on = 0, skip_off = 0;
+    for (const Case& c : cases) {
+        Config cfg;
+        cfg.width = uint16_t(c.w);
+        cfg.height = uint16_t(c.h);
+        cfg.tile_w = cfg.tile_h = uint8_t(c.tile);
+        cfg.motion = c.motion;
+        cfg.adaptive_huffman = c.huff;
+        cfg.skip_invisible = c.skip;
+        cfg.refresh_param = c.refresh;
+        cfg.motion_threshold_k = c.noise ? 1 : 3;
+        RunResult r = run_tjc3(cfg, 24, c.speed, c.noise);
+        CHECK(r.exact);
+        CHECK(r.min_psnr > 30.0);
+        bool v2 = !c.motion && !c.huff;
+        CHECK(std::memcmp(r.stream.data(), v2 ? "TJC2" : "TJC3", 4) == 0);
+        if (!c.motion) CHECK(r.inter == 0);
+        if (c.motion && c.speed) CHECK(r.inter > 0);
+        if (!c.huff) CHECK(r.tables == 0);
+        if (c.skip > 0) CHECK(r.dropped > 0);
+        if (std::string(c.name) == "pan 1.5px/frame") with_mc = r.stream.size();
+        if (std::string(c.name) == "pan, no motion comp.") without_mc = r.stream.size();
+        if (std::string(c.name) == "pan, standard tables") std_tables = r.stream.size();
+        if (std::string(c.name) == "static noise + skip") skip_on = r.stream.size();
+        if (std::string(c.name) == "static noise, no skip") skip_off = r.stream.size();
+        std::printf("  %-22s %7zu B  min PSNR %5.2f  inter tiles %5llu  table updates %3llu  dropped %llu\n", c.name,
+                    r.stream.size(), r.min_psnr, (unsigned long long)r.inter, (unsigned long long)r.tables,
+                    (unsigned long long)r.dropped);
+    }
+    CHECK(with_mc * 10 < without_mc * 6);  // motion compensation must pay off on a pan
+    CHECK(with_mc <= std_tables);           // adaptive tables never lose
+    CHECK(skip_on * 10 < skip_off * 8);     // skipping invisible updates saves on grain
+
+    // Output does not depend on the thread count.
+    std::vector<uint8_t> ref;
+    for (int threads : {1, 2, 3, 8}) {
+        Config cfg;
+        cfg.width = 200;
+        cfg.height = 120;
+        cfg.threads = threads;
+        cfg.skip_invisible = 1.0;
+        RunResult r = run_tjc3(cfg, 10, 3, true);
+        if (ref.empty()) ref = r.stream;
+        CHECK(r.stream == ref);
+    }
+    // The moving-box pattern with every tool on, against the decoder.
+    Config cfg;
+    cfg.width = 96;
+    cfg.height = 64;
+    RunResult r = run_tjc3(cfg, 30, 0, false, true);
+    CHECK(r.exact);
 }
 
 static void test_corrupt_input() {
@@ -827,6 +1092,10 @@ int main() {
     test_sync_drift();
     test_tjc1_compat();
     test_seeking();
+    test_optimal_huffman();
+    test_exp_golomb();
+    test_predict_block();
+    test_tjc3_pipeline();
     test_corrupt_input();
     std::printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;

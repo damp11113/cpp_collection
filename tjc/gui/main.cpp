@@ -187,6 +187,9 @@ struct App {
     int tile_mode = 1, tile_w = 16, tile_h = 16;
     int quality = 75, motion = 3, refresh_mode = 2, refresh_param = 30, diff_ref = 0;
     int keyframe_every = 0, threads = 0;
+    bool use_motion = true, adaptive_huff = true;
+    int effort = 1;
+    float skip_invisible = 0.0f;
     bool audio_on = true;
     int audio_rate_mode = 0, audio_ch_mode = 0;
     EncodeJob job;
@@ -275,12 +278,14 @@ void drop_callback(GLFWwindow*, int count, const char** paths) {
 void update_overlay(App& app) {
     const tjc::Layout& l = app.player.layout();
     app.overlay_rgba.assign(size_t(l.tiles) * 4, 0);
-    bool full = app.shown.stats.force_refresh;
     for (int t = 0; t < l.tiles && size_t(t) < app.shown.dirty.size(); ++t) {
-        if (!app.shown.dirty[size_t(t)]) continue;
         uint8_t* p = &app.overlay_rgba[size_t(t) * 4];
-        if (full) { p[0] = 60; p[1] = 130; p[2] = 255; p[3] = 70; }
-        else { p[0] = 255; p[1] = 60; p[2] = 40; p[3] = 110; }
+        switch (app.shown.dirty[size_t(t)]) {
+            case 1: p[0] = 255; p[1] = 60; p[2] = 40; p[3] = 110; break;   // intra
+            case 2: p[0] = 60; p[1] = 230; p[2] = 90; p[3] = 90; break;    // motion compensated
+            case 3: p[0] = 60; p[1] = 130; p[2] = 255; p[3] = 70; break;   // full refresh
+            default: break;
+        }
     }
     app.overlay_tex.upload(app.overlay_rgba.data(), l.cols, l.rows, true);
 }
@@ -310,6 +315,9 @@ void draw_info_panel(App& app) {
     const char* modes[] = {"none", "full periodic", "rolling"};
     ImGui::Text("Refresh %s / %u", modes[int(h.refresh_mode) % 3], h.refresh_param);
     ImGui::TextWrapped("Audio: %s", p.audio_status().c_str());
+    if (h.version >= 3)
+        ImGui::Text("Motion comp. %s, adaptive tables %s", (h.flags & tjc::kFlagMotion) ? "on" : "off",
+                    (h.flags & tjc::kFlagAdaptiveHuffman) ? "on" : "off");
 
     uint32_t frames = p.frames_indexed();
     ImGui::SeparatorText("File");
@@ -329,6 +337,8 @@ void draw_info_panel(App& app) {
         ImGui::Text("#%u  %s", app.shown.index, s.force_refresh ? "full refresh" : "update");
         ImGui::Text("Tiles %u / %u (%.1f%%)", s.dirty_tiles, s.total_tiles,
                     s.total_tiles ? 100.0 * s.dirty_tiles / s.total_tiles : 0.0);
+        if (h.flags & tjc::kFlagMotion) ImGui::Text("Motion compensated %u", s.inter_tiles);
+        if (s.tables) ImGui::TextUnformatted("New Huffman tables");
         ImGui::Text("Size %s", format_bytes(double(s.bytes)).c_str());
         if (h.audio_codec) ImGui::Text("Audio %u samples, %s", s.audio_samples, format_bytes(double(s.audio_bytes)).c_str());
         uint32_t sync = 0;
@@ -368,7 +378,8 @@ void draw_player(App& app) {
     float right = ImGui::GetContentRegionMax().x;
     ImGui::SameLine(right - ImGui::GetFontSize() * 25);
     if (ImGui::Checkbox("Tile overlay", &app.show_overlay)) {}
-    help_marker("Tints the tiles the current frame carried (T). Red = updated tile, blue = full refresh frame.");
+    help_marker("Tints the tiles the current frame carried (T). Red = coded from scratch (intra), "
+                "green = motion compensated, blue = full refresh frame.");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5);
     const char* matrices[] = {"Auto", "BT.601", "BT.709"};
@@ -532,6 +543,10 @@ bool build_settings(App& app, EncodeSettings& s, std::string& err) {
     c.refresh_param = uint32_t(std::clamp(app.refresh_param, 0, 65535));
     c.diff_reference = tjc::DiffReference(app.diff_ref);
     c.threads = std::max(0, app.threads);
+    c.motion = app.use_motion;
+    c.adaptive_huffman = app.adaptive_huff;
+    c.effort = std::clamp(app.effort, 0, 2);
+    c.skip_invisible = double(std::max(0.0f, app.skip_invisible));
     if (app.audio_on && app.info.has_audio) {
         static const int rates[] = {0, 48000, 44100, 32000, 22050, 16000, 8000};
         c.audio_rate = uint32_t(app.audio_rate_mode == 0 ? app.info.audio_rate : rates[app.audio_rate_mode]);
@@ -646,6 +661,28 @@ void draw_encoder(App& app) {
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
         ImGui::InputInt("Threads (0=all)", &app.threads);
 
+        ImGui::SeparatorText("Compression (TJC3)");
+        ImGui::Checkbox("Motion compensation", &app.use_motion);
+        help_marker("Tiles can be predicted from the previous frame: big savings on pans and moving objects. "
+                    "The player/decoder then keeps one extra frame in memory.");
+        ImGui::Checkbox("Adaptive Huffman tables", &app.adaptive_huff);
+        help_marker("Entropy tables fitted to the video, resent only when it pays off.");
+        bool tjc2 = !app.use_motion && !app.adaptive_huff;
+        if (ImGui::Checkbox("TJC2 compatible", &tjc2)) {
+            app.use_motion = !tjc2;
+            app.adaptive_huff = !tjc2;
+        }
+        help_marker("Turns both off: the file then plays on older TJC2 decoders (still ~5% smaller than before).");
+        const char* efforts[] = {"Fast", "Normal", "Best"};
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
+        ImGui::Combo("Effort", &app.effort, efforts, 3);
+        help_marker("Encoder speed vs file size. Normal is within ~0.5% of Best at 1.5x its speed. "
+                    "Never changes the file format.");
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
+        ImGui::SliderFloat("Skip invisible", &app.skip_invisible, 0.0f, 4.0f, app.skip_invisible > 0 ? "%.1f" : "off");
+        help_marker("Leave out tile updates that change no 8x8 block by more than this per pixel. "
+                    "1-2 shrinks grainy video a lot; static areas keep their last grain pattern.");
+
         ImGui::SeparatorText("Audio");
         bool has_audio = app.info.ok && app.info.has_audio;
         if (!has_audio) ImGui::BeginDisabled();
@@ -703,9 +740,9 @@ void draw_encoder(App& app) {
         double eta = speed > 0 && pr.total_estimate > pr.frames ? double(pr.total_estimate - pr.frames) / speed : 0;
         ImGui::Text("%.1f fps (%.2fx realtime)   elapsed %s   ETA %s", speed, speed / fps,
                     format_time(pr.elapsed).c_str(), pr.running ? format_time(eta).c_str() : "-");
-        ImGui::Text("Output %s   %.0f kbit/s   dirty tiles %.1f%%   audio %.0f kbit/s", format_bytes(double(pr.bytes)).c_str(),
-                    secs > 0 ? double(pr.bytes) * 8 / secs / 1000 : 0.0, pr.dirty_percent,
-                    secs > 0 ? double(pr.audio_bytes) * 8 / secs / 1000 : 0.0);
+        ImGui::Text("Output %s   %.0f kbit/s   dirty tiles %.1f%% (%.0f%% motion comp.)   audio %.0f kbit/s",
+                    format_bytes(double(pr.bytes)).c_str(), secs > 0 ? double(pr.bytes) * 8 / secs / 1000 : 0.0,
+                    pr.dirty_percent, pr.inter_percent, secs > 0 ? double(pr.audio_bytes) * 8 / secs / 1000 : 0.0);
         ImVec4 col = pr.failed ? ImVec4(1, 0.45f, 0.4f, 1) : (pr.done ? ImVec4(0.5f, 0.9f, 0.5f, 1) : ImVec4(1, 1, 1, 1));
         ImGui::PushTextWrapPos(0);
         ImGui::TextColored(col, "%s", pr.message.c_str());

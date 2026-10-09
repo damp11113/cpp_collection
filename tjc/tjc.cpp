@@ -1,4 +1,4 @@
-// tjc - command line encoder/decoder for the Tiled-JPEG Codec (TJC2).
+// tjc - command line encoder/decoder for the Tiled-JPEG Codec (TJC3, reads TJC1/2 too).
 //
 //   tjc encode --width W --height H [options] [--audio in.wav] [-i in.yuv] [-o out.tjc]
 //   tjc decode [-i in.tjc] [-o out.yuv] [--audio-out out.wav]
@@ -32,7 +32,7 @@ namespace {
 
 void usage() {
     std::fprintf(stderr,
-        "Tiled-JPEG Codec (TJC2)\n"
+        "Tiled-JPEG Codec (TJC3)\n"
         "\n"
         "usage:\n"
         "  tjc encode --width W --height H [options] [-i in.yuv] [-o out.tjc]\n"
@@ -54,6 +54,18 @@ void usage() {
         "  --keyframe-every N         also force a full refresh every N frames (default 0 = off)\n"
         "  --psnr                     report PSNR of the reconstruction vs the source\n"
         "  --threads N                encoder threads, 0 = all cores (default 0)\n"
+        "\n"
+        "compression tools:\n"
+        "  --motion on|off            motion compensation (default on; the decoder keeps one extra frame)\n"
+        "  --huffman adaptive|standard  Huffman tables fitted to the video (default adaptive)\n"
+        "  --format tjc2              plain TJC2 stream for older decoders (= --motion off --huffman standard)\n"
+        "  --deadzone X               AC rounding point 0..0.5 (default 0.33; 0.5 = plain rounding)\n"
+        "  --smart-refresh on|off     rolling refresh skips recently sent tiles (default on)\n"
+        "  --skip-invisible T         drop updates changing no 8x8 block by more than T per pixel\n"
+        "                             (default 0 = off; 1-2 shrinks grainy video, freezes grain)\n"
+        "  --motion-range N           motion search range in pixels (default 32)\n"
+        "  --effort fast|normal|best  encoder speed vs size (default normal; never changes the format)\n"
+        "  --sync-window N            max frames a decoder must go back to seek (default automatic)\n"
         "\n"
         "decode options:\n"
         "  --audio-out FILE.wav       write the audio track as a 16-bit PCM WAV file\n"
@@ -218,6 +230,38 @@ Options parse_args(int argc, char** argv) {
             o.keyframe_every = uint32_t(parse_int(next(), "--keyframe-every", 0, 1L << 30));
         } else if (a == "--threads") {
             o.cfg.threads = int(parse_int(next(), "--threads", 0, 256));
+        } else if (a == "--motion") {
+            std::string m = next();
+            if (m != "on" && m != "off") die("--motion takes on or off");
+            o.cfg.motion = m == "on";
+        } else if (a == "--huffman") {
+            std::string m = next();
+            if (m != "adaptive" && m != "standard") die("--huffman takes adaptive or standard");
+            o.cfg.adaptive_huffman = m == "adaptive";
+        } else if (a == "--format") {
+            std::string m = next();
+            if (m == "tjc2") { o.cfg.motion = false; o.cfg.adaptive_huffman = false; }
+            else if (m != "tjc3") die("--format takes tjc2 or tjc3");
+        } else if (a == "--deadzone") {
+            o.cfg.deadzone = std::atof(next());
+            if (!(o.cfg.deadzone >= 0 && o.cfg.deadzone <= 0.5)) die("--deadzone must be 0..0.5");
+        } else if (a == "--smart-refresh") {
+            std::string m = next();
+            if (m != "on" && m != "off") die("--smart-refresh takes on or off");
+            o.cfg.smart_refresh = m == "on";
+        } else if (a == "--skip-invisible") {
+            o.cfg.skip_invisible = std::atof(next());
+            if (!(o.cfg.skip_invisible >= 0 && o.cfg.skip_invisible <= 64)) die("--skip-invisible must be 0..64");
+        } else if (a == "--effort") {
+            std::string m = next();
+            if (m == "fast") o.cfg.effort = 0;
+            else if (m == "normal") o.cfg.effort = 1;
+            else if (m == "best") o.cfg.effort = 2;
+            else die("--effort takes fast, normal or best");
+        } else if (a == "--motion-range") {
+            o.cfg.motion_range = int(parse_int(next(), "--motion-range", 1, 1024));
+        } else if (a == "--sync-window") {
+            o.cfg.sync_window = uint32_t(parse_int(next(), "--sync-window", 0, 1L << 30));
         } else if (a == "--psnr") {
             o.psnr = true;
         } else {
@@ -395,19 +439,28 @@ void print_header(const tjc::StreamHeader& h, const tjc::Layout& l) {
                  l.tiles, h.quality, refresh_name(h.refresh_mode), h.refresh_param);
     if (h.audio_codec) std::fprintf(stderr, "audio:  QOA, %u Hz, %u channel(s)\n", h.audio_rate, h.audio_channels);
     else std::fprintf(stderr, "audio:  none\n");
+    if (h.version >= 3)
+        std::fprintf(stderr, "tools:  motion compensation %s, adaptive Huffman tables %s\n",
+                     (h.flags & tjc::kFlagMotion) ? "on" : "off", (h.flags & tjc::kFlagAdaptiveHuffman) ? "on" : "off");
 }
 
 void log_frame(const tjc::FrameStats& s, bool audio) {
-    std::fprintf(stderr, "frame %6u %c dirty %5u/%-5u (%5.1f%%) %8zu B", s.frame_num, s.force_refresh ? 'I' : 'P',
-                 s.dirty_tiles, s.total_tiles, 100.0 * s.dirty_tiles / (s.total_tiles ? s.total_tiles : 1), s.bytes);
+    std::fprintf(stderr, "frame %6u %c dirty %5u/%-5u (%5.1f%%) inter %5u%s %8zu B", s.frame_num,
+                 s.force_refresh ? 'I' : 'P', s.dirty_tiles, s.total_tiles,
+                 100.0 * s.dirty_tiles / (s.total_tiles ? s.total_tiles : 1), s.inter_tiles, s.tables ? " T" : "  ",
+                 s.bytes);
+    if (s.dropped_tiles) std::fprintf(stderr, " dropped %u", s.dropped_tiles);
     if (audio) std::fprintf(stderr, "  audio %5u smp %6zu B", s.audio_samples, s.audio_bytes);
     std::fprintf(stderr, "\n");
 }
 
 struct Totals {
     uint64_t frames = 0, iframes = 0, bytes = 0, dirty = 0, tiles = 0;
-    uint64_t audio_samples = 0, audio_bytes = 0, audio_padded = 0;
+    uint64_t audio_samples = 0, audio_bytes = 0, audio_padded = 0, inter = 0, dropped = 0, tables = 0;
     void add(const tjc::FrameStats& s) {
+        inter += s.inter_tiles;
+        dropped += s.dropped_tiles;
+        tables += s.tables;
         ++frames;
         iframes += s.force_refresh;
         bytes += s.bytes;
@@ -429,6 +482,10 @@ struct Totals {
                      frames ? double(stream_bytes) * 8.0 / secs / 1000.0 : 0.0, fps,
                      tiles ? 100.0 * double(dirty) / double(tiles) : 0.0,
                      stream_bytes ? raw / double(stream_bytes) : 0.0);
+        if (h.version >= 3 || dropped)
+            std::fprintf(stderr, "      motion compensated %.1f%% of sent tiles, %llu Huffman table updates%s\n",
+                         dirty ? 100.0 * double(inter) / double(dirty) : 0.0, (unsigned long long)tables,
+                         dropped ? (", " + std::to_string(dropped) + " invisible updates skipped").c_str() : "");
         if (h.audio_codec)
             std::fprintf(stderr, "      audio: %.2f s, %llu bytes, %.1f kbit/s\n", double(audio_samples) / h.audio_rate,
                          (unsigned long long)audio_bytes, secs > 0 ? double(audio_bytes) * 8.0 / secs / 1000.0 : 0.0);

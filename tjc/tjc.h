@@ -1,9 +1,10 @@
-// tjc.h - Tiled-JPEG Codec (stream format "TJC2"), single-header C++17 library.
+// tjc.h - Tiled-JPEG Codec (stream format "TJC3"; reads TJC1/TJC2), single-header C++17.
 //
 // A frame is split into fixed-size tiles. Each frame only carries the tiles that
 // changed (plus tiles picked by the refresh policy); every carried tile is coded as
-// a small baseline-JPEG-style blob (integer DCT, static quant tables, static JPEG
-// Huffman tables). The decoder keeps a persistent framebuffer and patches it.
+// a small baseline-JPEG-style blob (integer DCT, static quant tables, Huffman
+// tables), or (TJC3) as a motion-compensated copy of the previous frame plus a
+// coded residual. The decoder keeps a persistent framebuffer and patches it.
 // An optional audio track is interleaved per video frame, coded with QOA ("Quite OK
 // Audio", integer-only; see the QOA section below for its license notice).
 //
@@ -26,9 +27,9 @@
 // ---------------------------------------------------------------------------
 // Stream format (all multi-byte fields little-endian unless TJC_STREAM_BIG_ENDIAN)
 //
-//   Stream header, once. "TJC2" streams have 34 bytes; "TJC1" streams (no frame
-//   rate, no audio) have only the first 18 and are still decoded.
-//     magic         4  "TJC2" (or "TJC1")
+//   Stream header, once. "TJC2"/"TJC3" streams have 34 bytes; "TJC1" streams (no
+//   frame rate, no audio) have only the first 18 and are still decoded.
+//     magic         4  "TJC3" ("TJC2", "TJC1")
 //     width         2  pixels (luma)
 //     height        2  pixels (luma)
 //     tile_w        1  1..255 (see "Tiles" below)
@@ -44,12 +45,19 @@
 //     audio_codec   1  0 = none, 1 = QOA
 //     audio_chans   1  1..8
 //     audio_rate    4  sample rate in Hz, 1..16777215
-//     reserved      2  zero
+//     flags         1  TJC3: bit0 = adaptive Huffman tables, bit1 = motion
+//                      compensation (TJC2: zero)
+//     reserved      1  zero
 //
 //   Per frame:
 //     frame_num     4  uint32
-//     force_refresh 1  0 or 1; 1 = every tile follows and no bitmap is sent
-//     dirty_bitmap  ceil(tiles/8) bytes, only when force_refresh == 0.
+//     flags         1  bit0 = force refresh: every tile follows and no bitmap is sent;
+//                      bit1 = Huffman tables follow (TJC3 with adaptive tables only)
+//     tables        only with flags bit1: four tables (DC luma, AC luma, DC chroma,
+//                   AC chroma), each 16 code-length counts + the symbols, exactly as
+//                   in a JPEG DHT segment. They stay in force until replaced; every
+//                   stream starts with the standard JPEG (Annex K) tables.
+//     dirty_bitmap  ceil(tiles/8) bytes, only when force refresh is not set.
 //                   Tile i (raster order) is bit (i & 7) of byte (i >> 3), LSB first.
 //     per dirty tile, raster order:
 //       tile_len    2  payload size in bytes (1..65535)
@@ -64,7 +72,21 @@
 //   Tile payload: Huffman-coded 8x8 blocks, MSB-first bit packing, zero-padded to a
 //   byte, no marker byte stuffing. Block order: all Y blocks of the tile (raster),
 //   then all Cb blocks, then all Cr blocks. The DC predictor resets to 0 at the start
-//   of each component of each tile, so every tile decodes on its own.
+//   of each component of each tile.
+//
+//   Motion compensated streams (header flag bit1): every payload starts with
+//     mode       1 bit: 0 = intra (blocks as above), 1 = inter, followed by
+//     mvx, mvy   signed Exp-Golomb, minus the predictor: the vector of the previous
+//                coded tile in the same tile row if that one was inter, else (0,0).
+//                Units are half luma pixels.
+//     residual   1 bit: 1 = blocks follow (coded like intra blocks, no level shift,
+//                added to the prediction), 0 = plain copy of the prediction.
+//   The prediction is the previous decoded frame at the tile position moved by the
+//   vector; half-pel positions average 2 or 4 pixels ((a+b+1)>>1, (a+b+c+d+2)>>2).
+//   Chroma uses the luma vector >> 1 in chroma half-pels. The whole reference area
+//   must lie inside the padded frame. Decoders keep the previous frame for this.
+//   SyncTracker gives the frame to start decoding from to reproduce any frame
+//   exactly (for seeking); encoders limit vectors so that point stays close.
 //
 // Tiles: the codec works on an internal frame padded up to whole tiles (edge pixels
 // replicated) and crops on output, so frame sizes need not be tile multiples.
@@ -94,10 +116,18 @@
 
 namespace tjc {
 
-constexpr int kStreamHeaderSize = 34;    // TJC2
+constexpr int kStreamHeaderSize = 34;    // TJC2 and TJC3
 constexpr int kStreamHeaderSizeV1 = 18;  // TJC1
-constexpr int kFrameHeaderSize = 5;  // without the bitmap
+constexpr int kFrameHeaderSize = 5;      // without tables and bitmap
 constexpr int kMaxTilePayload = 65535;
+
+// StreamHeader::flags (TJC3)
+constexpr uint8_t kFlagAdaptiveHuffman = 1;  // frames may carry new Huffman tables
+constexpr uint8_t kFlagMotion = 2;           // tiles may be motion compensated
+
+// Frame flags byte
+constexpr uint8_t kFrameForceRefresh = 1;
+constexpr uint8_t kFrameTables = 2;
 
 enum class RefreshMode : uint8_t { None = 0, FullPeriodic = 1, Rolling = 2 };
 
@@ -141,6 +171,39 @@ struct Config {
     // Audio track: 0 channels = no audio. Feed samples with Encoder::push_audio().
     uint8_t audio_channels = 0;
     uint32_t audio_rate = 0;
+
+    // --- Compression tools. With motion and adaptive_huffman both off the stream
+    // is TJC2 and plays on TJC2 decoders; the other tools never affect the format.
+
+    // Motion compensation (TJC3): a tile may be predicted from the previous frame.
+    // The decoder then keeps one extra frame in memory.
+    bool motion = true;
+    int motion_range = 32;  // search range in luma pixels
+
+    // Encoder effort, trading speed for size: 0 = fast, 1 = normal, 2 = best.
+    // Only the motion search and coding decisions change, never the format.
+    int effort = 1;
+
+    // Per-stream Huffman tables fitted to the content (TJC3), resent only when it pays.
+    bool adaptive_huffman = true;
+
+    // Fraction of the quantizer step at which AC coefficients round up (0.5 = plain
+    // rounding). Smaller values zero more small coefficients: fewer bits for very
+    // little quality.
+    double deadzone = 0.33;
+
+    // Rolling refresh skips tiles whose content is already recent.
+    bool smart_refresh = true;
+
+    // Drop dirty tiles whose decoded picture would change by at most this mean
+    // absolute difference per sample in every 8x8 block (0 = off). Saves a lot on
+    // grainy video; static areas then keep their last grain pattern.
+    double skip_invisible = 0;
+
+    // Motion vectors may only read areas whose content was intra coded within this
+    // many frames, which bounds how far a decoder must go back to seek or join.
+    // 0 = automatic: twice the rolling refresh cycle, the refresh period, or no limit.
+    uint32_t sync_window = 0;
 };
 
 struct StreamHeader {
@@ -152,19 +215,23 @@ struct StreamHeader {
     RefreshMode refresh_mode = RefreshMode::None;
     uint16_t refresh_param = 0;
     uint8_t quality = 0;
-    uint8_t version = 2;      // 1 = TJC1 (fields below absent: 30 fps, no audio)
+    uint8_t version = 3;      // 1 = TJC1 (fields below absent: 30 fps, no audio), 2 = TJC2
     uint32_t fps_num = 30;
     uint32_t fps_den = 1;
     uint8_t audio_codec = 0;  // 0 = none, 1 = QOA
     uint8_t audio_channels = 0;
     uint32_t audio_rate = 0;
+    uint8_t flags = 0;        // TJC3: kFlagAdaptiveHuffman | kFlagMotion
 };
 
 struct FrameStats {
     uint32_t frame_num = 0;
     bool force_refresh = false;
-    uint32_t dirty_tiles = 0;
+    uint32_t dirty_tiles = 0;    // tiles carried by the frame
     uint32_t total_tiles = 0;
+    uint32_t inter_tiles = 0;    // of those, motion compensated
+    uint32_t dropped_tiles = 0;  // encoder: dirty tiles left out by skip_invisible
+    bool tables = false;         // the frame carried new Huffman tables
     size_t bytes = 0;            // encoded size of the frame record, audio included
     uint32_t audio_samples = 0;  // samples per channel carried by this frame
     size_t audio_bytes = 0;      // audio_len
@@ -215,11 +282,38 @@ const char* validate_geometry(int width, int height, int tile_w, int tile_h);
 
 Layout make_layout(int width, int height, int tile_w, int tile_h);
 
-// Writes a TJC2 header (kStreamHeaderSize bytes).
+// Writes a TJC2 header, or TJC3 when h.version == 3 (kStreamHeaderSize bytes).
 void write_stream_header(const StreamHeader& h, uint8_t out[kStreamHeaderSize]);
-// Parses a TJC1 header (size >= kStreamHeaderSizeV1) or TJC2 header
+// Parses a TJC1 header (size >= kStreamHeaderSizeV1) or TJC2/TJC3 header
 // (size >= kStreamHeaderSize). Returns Truncated if more bytes are needed.
 Status parse_stream_header(const uint8_t* in, size_t size, StreamHeader* h);
+
+// How a tile was coded in a frame.
+struct TileInfo {
+    uint8_t mode = 0;  // 0 = not sent, 1 = intra, 2 = motion compensated
+    int16_t mvx = 0, mvy = 0;  // half-pel luma units (mode 2)
+};
+
+// Tracks, for every tile, the frame its current content traces back to (the
+// "root": the last intra send, followed through motion vectors). Decoding from
+// sync point S = min(root) reproduces the frame exactly, whatever the decoder
+// held before. Used for exact seeking and by the encoder to bound it.
+class SyncTracker {
+public:
+    void reset(const Layout& l);
+    // Records frame `frame` (info: layout().tiles entries) and returns its sync point.
+    uint32_t add_frame(uint32_t frame, const TileInfo* info);
+    uint32_t sync_point() const;
+    uint32_t root(int tile) const { return root_[size_t(tile)]; }
+    // Oldest root among the tiles a motion vector at `tile` reads from.
+    uint32_t ref_root(int tile, int mvx, int mvy) const;
+
+private:
+    Layout l_;
+    std::vector<uint32_t> root_, next_;
+    std::vector<std::pair<uint32_t, uint32_t>> counts_;  // (root, tiles), sorted by root
+    void count_add(uint32_t root, int delta);
+};
 
 // Low-level building blocks, exposed for tests and for anyone porting the hot loops.
 namespace detail {
@@ -229,9 +323,13 @@ extern const uint8_t kZigzag[64];  // zigzag position -> natural (row-major) ind
 // Forward DCT of an 8x8 block of 8-bit samples (level-shifted internally).
 // Output is natural order, scaled up by 8 relative to the orthonormal DCT.
 void fdct8x8(const uint8_t* src, int stride, int32_t out[64]);
+// Same for signed residuals (-255..255), no level shift.
+void fdct8x8_residual(const int16_t* src, int stride, int32_t out[64]);
 
 // Inverse DCT of dequantized natural-order coefficients (each within [-2048, 2047]).
 void idct8x8(const int32_t in[64], uint8_t* dst, int stride);
+// Adds the inverse DCT (no level shift) to a prediction: dst = clamp(pred + idct).
+void idct8x8_add(const int32_t in[64], const uint8_t* pred, int pstride, uint8_t* dst, int stride);
 
 // Fast path for blocks whose AC coefficients are all zero. Bit-identical to idct8x8.
 void idct8x8_dc(int32_t dc, uint8_t* dst, int stride);
@@ -262,17 +360,40 @@ struct HuffDec {
     uint8_t vals[256];
 };
 
+// A table in JPEG DHT form: bits[i] = number of codes of length i + 1.
+struct HuffSpec {
+    uint8_t bits[16] = {};
+    uint8_t vals[256] = {};
+    int count() const;
+};
+
+// The four tables a stream uses: 0 = DC luma, 1 = AC luma, 2 = DC chroma, 3 = AC chroma.
+struct HuffSet {
+    HuffSpec spec[4];
+    HuffEnc enc[4];
+    HuffDec dec[4];
+    // Builds the codes from spec; false if a table is malformed.
+    bool build();
+};
+
+// The standard JPEG tables (ITU T.81 Annex K.3).
+const HuffSet& standard_huff();
+
+// Optimal length-limited (16 bit) table for the given symbol counts, using the
+// libjpeg procedure. Symbols with count 0 get no code.
+HuffSpec optimal_huff(const uint32_t freq[256]);
+
+// Kept for the tests: the standard tables in the old layout.
 struct HuffTables {
     HuffEnc enc_dc[2], enc_ac[2];  // [0] = luma, [1] = chroma
     HuffDec dec_dc[2], dec_ac[2];
 };
-
 const HuffTables& huff_tables();
 
 class BitWriter {
 public:
     explicit BitWriter(std::vector<uint8_t>& out) : out_(out) {}
-    void put(uint32_t bits, int len);
+    void put(uint32_t bits, int len);  // len <= 24
     void flush();  // pad the last byte with zeros
 
 private:
@@ -312,16 +433,40 @@ private:
     int cnt_ = 0;
 };
 
+// Signed Exp-Golomb codes (motion vectors).
+void put_se(BitWriter& bw, int v);
+bool get_se(BitReader& br, int* v);  // false for codes longer than 2 * 20 + 1 bits
+int se_bits(int v);
+
 // Returns the decoded symbol, or -1 for an invalid code.
 int huff_decode(BitReader& br, const HuffDec& t);
 
-// Entropy-code one block of quantized coefficients given in zigzag order.
-// Coefficients must lie in [-1023, 1023]. dc_pred is updated.
+// The encoder collects a frame as tokens first, so the Huffman tables can be
+// chosen after seeing the whole frame. A token is a Huffman symbol from table
+// 0..3 followed by nbits raw bits, or (table == kRawToken) just raw bits.
+constexpr uint8_t kRawToken = 255;
+struct Token {
+    uint8_t table;
+    uint8_t sym;
+    uint8_t nbits;
+    uint32_t bits;
+};
+
+// Tokens for one block of quantized coefficients (zigzag order, within
+// [-1023, 1023]); comp 0 = luma, 1 = chroma. dc_pred is updated.
+void tokenize_block(const int16_t zz[64], int& dc_pred, int comp, std::vector<Token>& out);
+void emit_tokens(const Token* t, size_t n, const HuffSet& hs, BitWriter& bw);
+uint64_t token_bits(const Token* t, size_t n, const HuffSet& hs);
+
+// Entropy-code one block with the standard tables (tokenize + emit).
 void encode_block(BitWriter& bw, const int16_t zz[64], int& dc_pred, int table);
 
 // Decode one block into natural-order dequantized coefficients (clamped to
 // [-2048, 2047]). dq is the quant table in zigzag order. dc_pred is updated.
 // Returns -1 on bad data, 0 when only DC is present, 1 when any AC is present.
+int decode_block(BitReader& br, const HuffDec& dc, const HuffDec& ac, const uint16_t dq[64], int& dc_pred,
+                 int32_t coef[64]);
+// Same with the standard tables (table 0 = luma, 1 = chroma).
 int decode_block(BitReader& br, int table, const uint16_t dq[64], int& dc_pred, int32_t coef[64]);
 
 void pack_bitmap(const uint8_t* flags, int n, uint8_t* out);
@@ -330,6 +475,16 @@ void unpack_bitmap(const uint8_t* in, int n, uint8_t* flags);
 // Sum of absolute differences between two w x h areas, stopping early once it
 // exceeds `limit` (the returned value is then > limit but not exact).
 uint64_t sad(const uint8_t* a, int astride, const uint8_t* b, int bstride, int w, int h, uint64_t limit);
+
+// Motion compensation: the w x h prediction for the area at (x, y) of a plane,
+// displaced by (mvx, mvy) half-pels. The caller guarantees the area plus one
+// pixel for half-pel positions lies inside the plane.
+void predict_block(const uint8_t* plane, int stride, int x, int y, int mvx, int mvy, int w, int h, uint8_t* out,
+                   int ostride);
+// True if a vector keeps every component's reference area inside the padded frame.
+bool mv_in_bounds(const Layout& l, int tile, int mvx, int mvy);
+// Chroma vector (half-pel chroma units) for a luma vector.
+inline int chroma_mv(int v) { return v >> 1; }
 
 class RefreshPolicy {
 public:
@@ -390,17 +545,20 @@ struct Planes {
 
 class Decoder {
 public:
-    // Reads and validates the stream header (TJC1 or TJC2), allocates the
+    // Reads and validates the stream header (TJC1, TJC2 or TJC3), allocates the
     // framebuffer (initialized to black). Must be called first.
     Status read_header(ReadFn fn, void* user);
 
     // Reads and applies one frame record. Returns EndOfStream at clean EOF.
     // With apply = false the record is only parsed (for indexing a stream): the
-    // framebuffer and audio are left alone, stats and dirty_flags() still update.
+    // picture and audio are left alone; stats, dirty_flags(), tile_info() and the
+    // Huffman tables still update.
     Status decode_frame(ReadFn fn, void* user, FrameStats* stats = nullptr, bool apply = true);
 
     // Which tiles the last frame carried (layout().tiles entries, 1 = sent).
     const uint8_t* dirty_flags() const { return dirty_.data(); }
+    // How each tile of the last frame was coded.
+    const TileInfo* tile_info() const { return info_.data(); }
 
     const StreamHeader& header() const { return header_; }
     const Layout& layout() const { return layout_; }
@@ -418,14 +576,16 @@ public:
     size_t audio_samples() const { return audio_samples_; }
 
 private:
-    bool decode_tile(const uint8_t* data, size_t size, int tile);
+    bool decode_tile(const uint8_t* data, size_t size, int tile, bool apply, int& last_row, TileInfo& last);
     Status decode_audio(ReadFn fn, void* user, size_t* bytes, bool apply);
 
     StreamHeader header_;
     Layout layout_;
-    Planes fb_;
+    Planes fb_, ref_;  // ref_: previous frame, only for motion compensated streams
     uint16_t dq_[2][64] = {};  // dequant tables, zigzag order
+    detail::HuffSet huff_;
     std::vector<uint8_t> dirty_, bitmap_, payload_;
+    std::vector<TileInfo> info_;
     std::vector<int16_t> audio_;
     size_t audio_samples_ = 0;
     bool ready_ = false;
@@ -443,7 +603,7 @@ public:
     const Layout& layout() const { return layout_; }
     StreamHeader stream_header() const;
 
-    // Appends the 18-byte stream header.
+    // Appends the stream header.
     void write_stream_header(std::vector<uint8_t>& out) const;
 
     // Encodes one tightly packed YUV420P frame of frame_size(width, height) bytes
@@ -469,22 +629,47 @@ public:
     void copy_recon(uint8_t* dst) const;
 
 private:
+    struct TileCode {
+        int worker = 0;
+        size_t tok_begin = 0, tok_end = 0;
+        TileInfo info;
+        bool dropped = false;
+    };
+    struct Scratch;
+
     void load(const uint8_t* y, int ys, const uint8_t* u, int us, const uint8_t* v, int vs);
     bool tile_changed(int tile) const;
-    void encode_tile(int tile, std::vector<uint8_t>& out);
+    void code_tile(int tile, bool allow_inter, bool may_drop, int pmvx, int pmvy, Scratch& s, TileCode& tc);
+    void intra_tokens(int tile, Scratch& s, std::vector<detail::Token>& out);
+    bool inter_tokens(int tile, int mvx, int mvy, Scratch& s, std::vector<detail::Token>& out);
+    void quantize(const int32_t dct[64], int comp, int16_t zz[64], int32_t deq[64], bool* has_ac) const;
+    void search_motion(int tile, int pmvx, int pmvy, Scratch& s, int& mvx, int& mvy);
+    uint64_t tile_sse(int tile) const;
     void copy_tile(const Planes& from, Planes& to, int tile);
+    void pick_refresh(uint8_t* rolling);
+    void choose_tables(bool force, bool* send);
     template <class F> void parallel_for(int n, int min_per_thread, F fn);
 
     Config cfg_;
     Layout layout_;
-    Planes cur_, last_coded_, recon_;
-    uint16_t q_[2][64] = {};      // natural order
-    uint32_t qdiv_[2][64] = {};   // zigzag order: 8 * q, the forward DCT's scale included
-    uint64_t qrecip_[2][64] = {}; // zigzag order: detail::quant_recip(qdiv_)
+    StreamHeader header_;
+    Planes cur_, last_coded_, recon_, ref_;
+    uint16_t q_[2][64] = {};       // natural order
+    uint64_t qrecip_[2][64] = {};  // zigzag order: reciprocal of 8 * q
+    uint32_t qround_[2][64] = {};  // zigzag order: rounding offset (deadzone)
+    double lambda_ = 0;            // rate-distortion trade-off, squared error per bit
     detail::RefreshPolicy policy_;
-    std::vector<uint8_t> dirty_;
+    detail::HuffSet huff_;         // tables the decoder currently holds
+    uint64_t hist_[4][256] = {};   // decayed symbol statistics
+    SyncTracker sync_;
+    std::vector<uint8_t> dirty_, rolling_;
     std::vector<int> dirty_list_;
+    std::vector<TileCode> codes_;
+    std::vector<TileInfo> info_;
+    std::vector<int16_t> prev_mvx_, prev_mvy_;  // last frame's vectors, search candidates
+    std::vector<std::vector<detail::Token>> worker_tokens_;
     std::vector<std::vector<uint8_t>> worker_out_;
+    int roll_cursor_ = 0;
     int threads_ = 1;
     uint32_t frame_num_ = 0;
     uint32_t frame_index_ = 0;
@@ -509,6 +694,7 @@ private:
 #define TJC_IMPLEMENTATION_DONE
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #if !defined(TJC_NO_ENCODER) && !defined(TJC_NO_THREADS)
 #include <thread>
@@ -627,33 +813,6 @@ const uint8_t kAcChromaVals[162] = {
     0xf9, 0xfa,
 };
 
-void build_huff(const uint8_t bits[16], const uint8_t* vals, detail::HuffEnc& enc, detail::HuffDec& dec) {
-    std::memset(&enc, 0, sizeof(enc));
-    std::memset(&dec, 0, sizeof(dec));
-    uint32_t code = 0;
-    int k = 0;
-    for (int len = 1; len <= 16; ++len) {
-        int n = bits[len - 1];
-        dec.maxcode[len] = -1;
-        if (n) {
-            dec.valoff[len] = k - int32_t(code);
-            for (int i = 0; i < n; ++i, ++k, ++code) {
-                uint8_t sym = vals[k];
-                dec.vals[k] = sym;
-                enc.code[sym] = uint16_t(code);
-                enc.size[sym] = uint8_t(len);
-                if (len <= 9) {
-                    uint32_t first = code << (9 - len);
-                    uint32_t count = 1u << (9 - len);
-                    for (uint32_t j = 0; j < count; ++j) dec.lut[first + j] = uint16_t((len << 8) | sym);
-                }
-            }
-            dec.maxcode[len] = int32_t(code) - 1;
-        }
-        code <<= 1;
-    }
-}
-
 inline int bit_count(int v) {
     int n = 0;
     while (v) { ++n; v >>= 1; }
@@ -697,7 +856,8 @@ size_t worst_case_tile_bytes(int tile_w, int tile_h) {
     // Per block: DC <= 16+11 bits, 63 AC <= 16+10 bits.
     size_t luma = size_t((tile_w + 7) / 8) * size_t((tile_h + 7) / 8);
     size_t chroma = size_t(((tile_w + 1) / 2 + 7) / 8) * size_t(((tile_h + 1) / 2 + 7) / 8);
-    return ((luma + 2 * chroma) * (27 + 63 * 26) + 7) / 8;
+    // + 16 bytes for the motion vector header of motion compensated tiles.
+    return ((luma + 2 * chroma) * (27 + 63 * 26) + 7) / 8 + 16;
 }
 
 const char* validate_geometry(int width, int height, int tile_w, int tile_h) {
@@ -728,7 +888,7 @@ Layout make_layout(int width, int height, int tile_w, int tile_h) {
 
 void write_stream_header(const StreamHeader& h, uint8_t out[kStreamHeaderSize]) {
     std::memset(out, 0, kStreamHeaderSize);
-    out[0] = 'T'; out[1] = 'J'; out[2] = 'C'; out[3] = '2';
+    out[0] = 'T'; out[1] = 'J'; out[2] = 'C'; out[3] = h.version >= 3 ? '3' : '2';
     put_u16(out + 4, h.width);
     put_u16(out + 6, h.height);
     out[8] = h.tile_w;
@@ -742,15 +902,16 @@ void write_stream_header(const StreamHeader& h, uint8_t out[kStreamHeaderSize]) 
     out[26] = h.audio_codec;
     out[27] = h.audio_codec ? h.audio_channels : 0;
     put_u32(out + 28, h.audio_codec ? h.audio_rate : 0);
+    if (h.version >= 3) out[32] = h.flags;
 }
 
 Status parse_stream_header(const uint8_t* in, size_t size, StreamHeader* h) {
     if (size < 4) return Status::Truncated;
-    if (in[0] != 'T' || in[1] != 'J' || in[2] != 'C' || (in[3] != '1' && in[3] != '2')) return Status::BadHeader;
+    if (in[0] != 'T' || in[1] != 'J' || in[2] != 'C' || in[3] < '1' || in[3] > '3') return Status::BadHeader;
     StreamHeader r;
     r.version = uint8_t(in[3] - '0');
     if (size < size_t(r.version == 1 ? kStreamHeaderSizeV1 : kStreamHeaderSize)) return Status::Truncated;
-    if (r.version == 2) {
+    if (r.version >= 2) {
         r.fps_num = get_u32(in + 18);
         r.fps_den = get_u32(in + 22);
         r.audio_codec = in[26];
@@ -761,6 +922,10 @@ Status parse_stream_header(const uint8_t* in, size_t size, StreamHeader* h) {
             if (r.audio_channels < 1 || r.audio_channels > detail::qoa::kMaxChannels || r.audio_rate < 1 ||
                 r.audio_rate > 0xffffff)
                 return Status::BadHeader;
+        }
+        if (r.version >= 3) {
+            r.flags = in[32];
+            if (r.flags & ~(kFlagAdaptiveHuffman | kFlagMotion)) return Status::BadHeader;
         }
     }
     r.width = uint16_t(get_u16(in + 4));
@@ -877,15 +1042,19 @@ constexpr int32_t FIX_3_072711026 = 25172;
 inline int32_t descale(int32_t x, int n) { return (x + (int32_t(1) << (n - 1))) >> n; }
 }  // namespace
 
-void fdct8x8(const uint8_t* src, int stride, int32_t out[64]) {
+namespace {
+
+// Rows of the forward DCT; bias2 = 256 level-shifts 8-bit samples, 0 for residuals.
+template <class T>
+void fdct_impl(const T* src, int stride, int32_t bias2, int32_t out[64]) {
     int32_t ws[64];
     for (int y = 0; y < 8; ++y) {
-        const uint8_t* s = src + size_t(y) * stride;
+        const T* s = src + size_t(y) * size_t(stride);
         int32_t* o = ws + y * 8;
-        int32_t tmp0 = s[0] + s[7] - 256, tmp7 = s[0] - s[7];
-        int32_t tmp1 = s[1] + s[6] - 256, tmp6 = s[1] - s[6];
-        int32_t tmp2 = s[2] + s[5] - 256, tmp5 = s[2] - s[5];
-        int32_t tmp3 = s[3] + s[4] - 256, tmp4 = s[3] - s[4];
+        int32_t tmp0 = int32_t(s[0]) + s[7] - bias2, tmp7 = int32_t(s[0]) - s[7];
+        int32_t tmp1 = int32_t(s[1]) + s[6] - bias2, tmp6 = int32_t(s[1]) - s[6];
+        int32_t tmp2 = int32_t(s[2]) + s[5] - bias2, tmp5 = int32_t(s[2]) - s[5];
+        int32_t tmp3 = int32_t(s[3]) + s[4] - bias2, tmp4 = int32_t(s[3]) - s[4];
 
         int32_t tmp10 = tmp0 + tmp3, tmp13 = tmp0 - tmp3;
         int32_t tmp11 = tmp1 + tmp2, tmp12 = tmp1 - tmp2;
@@ -939,7 +1108,9 @@ void fdct8x8(const uint8_t* src, int stride, int32_t out[64]) {
     }
 }
 
-void idct8x8(const int32_t in[64], uint8_t* dst, int stride) {
+// Inverse DCT; store(y, x, v) receives each output sample before the level shift.
+template <class Store>
+inline void idct_impl(const int32_t in[64], Store store) {
     int32_t ws[64];
     // Pass 1: columns. Inputs within 11 bits + sign keep every product in 32 bits.
     for (int x = 0; x < 8; ++x) {
@@ -984,14 +1155,13 @@ void idct8x8(const int32_t in[64], uint8_t* dst, int stride) {
         w[24] = descale(tmp13 + tmp0, sh);
         w[32] = descale(tmp13 - tmp0, sh);
     }
-    // Pass 2: rows, removing the remaining scale (incl. the factor of 8) and level shift.
+    // Pass 2: rows, removing the remaining scale (incl. the factor of 8).
     const int sh = kConstBits + kPass1Bits + 3;
     for (int y = 0; y < 8; ++y) {
         const int32_t* r = ws + y * 8;
-        uint8_t* o = dst + size_t(y) * stride;
         if ((r[1] | r[2] | r[3] | r[4] | r[5] | r[6] | r[7]) == 0) {
-            uint8_t v = clamp_u8(descale(r[0] * (1 << kConstBits), sh) + 128);
-            std::memset(o, v, 8);
+            int32_t v = descale(r[0] * (1 << kConstBits), sh);
+            for (int x = 0; x < 8; ++x) store(y, x, v);
             continue;
         }
         int32_t z2 = r[2], z3 = r[6];
@@ -1016,15 +1186,72 @@ void idct8x8(const int32_t in[64], uint8_t* dst, int stride) {
         z3 += z5; z4 += z5;
         tmp0 += z1 + z3; tmp1 += z2 + z4; tmp2 += z2 + z3; tmp3 += z1 + z4;
 
-        o[0] = clamp_u8(descale(tmp10 + tmp3, sh) + 128);
-        o[7] = clamp_u8(descale(tmp10 - tmp3, sh) + 128);
-        o[1] = clamp_u8(descale(tmp11 + tmp2, sh) + 128);
-        o[6] = clamp_u8(descale(tmp11 - tmp2, sh) + 128);
-        o[2] = clamp_u8(descale(tmp12 + tmp1, sh) + 128);
-        o[5] = clamp_u8(descale(tmp12 - tmp1, sh) + 128);
-        o[3] = clamp_u8(descale(tmp13 + tmp0, sh) + 128);
-        o[4] = clamp_u8(descale(tmp13 - tmp0, sh) + 128);
+        store(y, 0, descale(tmp10 + tmp3, sh));
+        store(y, 7, descale(tmp10 - tmp3, sh));
+        store(y, 1, descale(tmp11 + tmp2, sh));
+        store(y, 6, descale(tmp11 - tmp2, sh));
+        store(y, 2, descale(tmp12 + tmp1, sh));
+        store(y, 5, descale(tmp12 - tmp1, sh));
+        store(y, 3, descale(tmp13 + tmp0, sh));
+        store(y, 4, descale(tmp13 - tmp0, sh));
     }
+}
+
+// Canonical codes for a table; false if it is malformed (too many codes for a
+// length, duplicate symbols, no symbols).
+bool build_codes(const HuffSpec& s, HuffEnc& enc, HuffDec& dec) {
+    std::memset(&enc, 0, sizeof(enc));
+    std::memset(&dec, 0, sizeof(dec));
+    bool seen[256] = {};
+    uint32_t code = 0;
+    int k = 0;
+    for (int len = 1; len <= 16; ++len) {
+        int n = s.bits[len - 1];
+        dec.maxcode[len] = -1;
+        if (n) {
+            if (k + n > 256 || code + uint32_t(n) > (1u << len)) return false;
+            dec.valoff[len] = k - int32_t(code);
+            for (int i = 0; i < n; ++i, ++k, ++code) {
+                uint8_t sym = s.vals[k];
+                if (seen[sym]) return false;
+                seen[sym] = true;
+                dec.vals[k] = sym;
+                enc.code[sym] = uint16_t(code);
+                enc.size[sym] = uint8_t(len);
+                if (len <= 9) {
+                    uint32_t first = code << (9 - len);
+                    uint32_t count = 1u << (9 - len);
+                    for (uint32_t j = 0; j < count; ++j) dec.lut[first + j] = uint16_t((len << 8) | sym);
+                }
+            }
+            dec.maxcode[len] = int32_t(code) - 1;
+        }
+        code <<= 1;
+    }
+    return k > 0;
+}
+
+HuffSpec make_spec(const uint8_t bits[16], const uint8_t* vals) {
+    HuffSpec s;
+    std::memcpy(s.bits, bits, 16);
+    std::memcpy(s.vals, vals, size_t(s.count()));
+    return s;
+}
+
+}  // namespace
+
+void fdct8x8(const uint8_t* src, int stride, int32_t out[64]) { fdct_impl(src, stride, 256, out); }
+
+void fdct8x8_residual(const int16_t* src, int stride, int32_t out[64]) { fdct_impl(src, stride, 0, out); }
+
+void idct8x8(const int32_t in[64], uint8_t* dst, int stride) {
+    idct_impl(in, [&](int y, int x, int32_t v) { dst[size_t(y) * size_t(stride) + size_t(x)] = clamp_u8(v + 128); });
+}
+
+void idct8x8_add(const int32_t in[64], const uint8_t* pred, int pstride, uint8_t* dst, int stride) {
+    idct_impl(in, [&](int y, int x, int32_t v) {
+        dst[size_t(y) * size_t(stride) + size_t(x)] = clamp_u8(pred[size_t(y) * size_t(pstride) + size_t(x)] + v);
+    });
 }
 
 void idct8x8_dc(int32_t dc, uint8_t* dst, int stride) {
@@ -1046,16 +1273,103 @@ void build_quant_tables(int quality, uint16_t luma[64], uint16_t chroma[64]) {
     }
 }
 
+int HuffSpec::count() const {
+    int n = 0;
+    for (int i = 0; i < 16; ++i) n += bits[i];
+    return n;
+}
+
+bool HuffSet::build() {
+    for (int i = 0; i < 4; ++i)
+        if (!build_codes(spec[i], enc[i], dec[i])) return false;
+    return true;
+}
+
+const HuffSet& standard_huff() {
+    static const HuffSet set = [] {
+        HuffSet s;
+        s.spec[0] = make_spec(kDcLumaBits, kDcLumaVals);
+        s.spec[1] = make_spec(kAcLumaBits, kAcLumaVals);
+        s.spec[2] = make_spec(kDcChromaBits, kDcChromaVals);
+        s.spec[3] = make_spec(kAcChromaBits, kAcChromaVals);
+        s.build();
+        return s;
+    }();
+    return set;
+}
+
 const HuffTables& huff_tables() {
     static const HuffTables tables = [] {
+        const HuffSet& s = standard_huff();
         HuffTables t;
-        build_huff(kDcLumaBits, kDcLumaVals, t.enc_dc[0], t.dec_dc[0]);
-        build_huff(kDcChromaBits, kDcChromaVals, t.enc_dc[1], t.dec_dc[1]);
-        build_huff(kAcLumaBits, kAcLumaVals, t.enc_ac[0], t.dec_ac[0]);
-        build_huff(kAcChromaBits, kAcChromaVals, t.enc_ac[1], t.dec_ac[1]);
+        t.enc_dc[0] = s.enc[0];
+        t.enc_ac[0] = s.enc[1];
+        t.enc_dc[1] = s.enc[2];
+        t.enc_ac[1] = s.enc[3];
+        t.dec_dc[0] = s.dec[0];
+        t.dec_ac[0] = s.dec[1];
+        t.dec_dc[1] = s.dec[2];
+        t.dec_ac[1] = s.dec[3];
         return t;
     }();
     return tables;
+}
+
+HuffSpec optimal_huff(const uint32_t freq_in[256]) {
+    // ITU T.81 Annex K.2 / libjpeg jpeg_gen_optimal_table. Symbol 256 is a dummy
+    // that reserves the all-ones code.
+    HuffSpec out;
+    int64_t freq[257];
+    int codesize[257] = {};
+    int others[257];
+    bool any = false;
+    for (int i = 0; i < 256; ++i) {
+        freq[i] = freq_in[i];
+        any |= freq_in[i] != 0;
+    }
+    if (!any) return out;
+    freq[256] = 1;
+    for (int& o : others) o = -1;
+    for (;;) {
+        int c1 = -1, c2 = -1;
+        int64_t v = INT64_MAX;
+        for (int i = 0; i <= 256; ++i)
+            if (freq[i] && freq[i] <= v) { v = freq[i]; c1 = i; }
+        v = INT64_MAX;
+        for (int i = 0; i <= 256; ++i)
+            if (freq[i] && freq[i] <= v && i != c1) { v = freq[i]; c2 = i; }
+        if (c2 < 0) break;
+        freq[c1] += freq[c2];
+        freq[c2] = 0;
+        ++codesize[c1];
+        while (others[c1] >= 0) { c1 = others[c1]; ++codesize[c1]; }
+        others[c1] = c2;
+        ++codesize[c2];
+        while (others[c2] >= 0) { c2 = others[c2]; ++codesize[c2]; }
+    }
+    int bits[300] = {};
+    for (int i = 0; i <= 256; ++i)
+        if (codesize[i]) ++bits[codesize[i]];
+    // Limit code lengths to 16 bits.
+    for (int i = 299; i > 16; --i) {
+        while (bits[i] > 0) {
+            int j = i - 2;
+            while (bits[j] == 0) --j;
+            bits[i] -= 2;
+            ++bits[i - 1];
+            bits[j + 1] += 2;
+            --bits[j];
+        }
+    }
+    int i = 16;
+    while (bits[i] == 0) --i;
+    --bits[i];  // drop the reserved code
+    for (int len = 1; len <= 16; ++len) out.bits[len - 1] = uint8_t(bits[len]);
+    int p = 0;
+    for (int len = 1; len < 300; ++len)
+        for (int sym = 0; sym < 256; ++sym)
+            if (codesize[sym] == len) out.vals[p++] = uint8_t(sym);
+    return out;
 }
 
 void BitWriter::put(uint32_t bits, int len) {
@@ -1072,6 +1386,27 @@ void BitWriter::flush() {
     if (n_ > 0) out_.push_back(uint8_t(acc_ << (8 - n_)));
     acc_ = 0;
     n_ = 0;
+}
+
+int se_bits(int v) {
+    uint32_t k = v > 0 ? uint32_t(2 * v - 1) : uint32_t(-2 * int64_t(v));
+    return 2 * bit_count(int(k + 1)) - 1;
+}
+
+void put_se(BitWriter& bw, int v) {
+    uint32_t k = v > 0 ? uint32_t(2 * v - 1) : uint32_t(-2 * int64_t(v));
+    int m = bit_count(int(k + 1));
+    bw.put(0, m - 1);
+    bw.put(k + 1, m);
+}
+
+bool get_se(BitReader& br, int* v) {
+    int zeros = 0;
+    while (br.get(1) == 0)
+        if (++zeros > 20) return false;
+    uint32_t k = ((1u << zeros) | br.get(zeros)) - 1;
+    *v = (k & 1) ? int((k + 1) / 2) : -int(k / 2);
+    return true;
 }
 
 int huff_decode(BitReader& br, const HuffDec& t) {
@@ -1091,17 +1426,12 @@ int huff_decode(BitReader& br, const HuffDec& t) {
     return -1;
 }
 
-void encode_block(BitWriter& bw, const int16_t zz[64], int& dc_pred, int table) {
-    const HuffTables& ht = huff_tables();
-    const HuffEnc& dc = ht.enc_dc[table];
-    const HuffEnc& ac = ht.enc_ac[table];
-
+void tokenize_block(const int16_t zz[64], int& dc_pred, int comp, std::vector<Token>& out) {
+    const uint8_t td = comp ? 2 : 0, ta = comp ? 3 : 1;
     int diff = zz[0] - dc_pred;
     dc_pred = zz[0];
     int s = bit_count(diff < 0 ? -diff : diff);
-    bw.put(dc.code[s], dc.size[s]);
-    bw.put(uint32_t(diff < 0 ? diff - 1 : diff), s);
-
+    out.push_back({td, uint8_t(s), uint8_t(s), uint32_t(diff < 0 ? diff - 1 : diff) & ((1u << s) - 1)});
     int run = 0;
     for (int k = 1; k < 64; ++k) {
         int v = zz[k];
@@ -1110,23 +1440,42 @@ void encode_block(BitWriter& bw, const int16_t zz[64], int& dc_pred, int table) 
             continue;
         }
         while (run > 15) {
-            bw.put(ac.code[0xf0], ac.size[0xf0]);
+            out.push_back({ta, 0xf0, 0, 0});
             run -= 16;
         }
         s = bit_count(v < 0 ? -v : v);
-        int sym = (run << 4) | s;
-        bw.put(ac.code[sym], ac.size[sym]);
-        bw.put(uint32_t(v < 0 ? v - 1 : v), s);
+        out.push_back({ta, uint8_t((run << 4) | s), uint8_t(s), uint32_t(v < 0 ? v - 1 : v) & ((1u << s) - 1)});
         run = 0;
     }
-    if (run) bw.put(ac.code[0x00], ac.size[0x00]);
+    if (run) out.push_back({ta, 0x00, 0, 0});
 }
 
-int decode_block(BitReader& br, int table, const uint16_t dq[64], int& dc_pred, int32_t coef[64]) {
-    const HuffTables& ht = huff_tables();
-    std::memset(coef, 0, 64 * sizeof(int32_t));
+void emit_tokens(const Token* t, size_t n, const HuffSet& hs, BitWriter& bw) {
+    for (size_t i = 0; i < n; ++i) {
+        if (t[i].table != kRawToken) bw.put(hs.enc[t[i].table].code[t[i].sym], hs.enc[t[i].table].size[t[i].sym]);
+        bw.put(t[i].bits, t[i].nbits);
+    }
+}
 
-    int s = huff_decode(br, ht.dec_dc[table]);
+uint64_t token_bits(const Token* t, size_t n, const HuffSet& hs) {
+    uint64_t bits = 0;
+    for (size_t i = 0; i < n; ++i) {
+        bits += t[i].nbits;
+        if (t[i].table != kRawToken) bits += hs.enc[t[i].table].size[t[i].sym];
+    }
+    return bits;
+}
+
+void encode_block(BitWriter& bw, const int16_t zz[64], int& dc_pred, int table) {
+    std::vector<Token> toks;
+    tokenize_block(zz, dc_pred, table, toks);
+    emit_tokens(toks.data(), toks.size(), standard_huff(), bw);
+}
+
+int decode_block(BitReader& br, const HuffDec& hdc, const HuffDec& hac, const uint16_t dq[64], int& dc_pred,
+                 int32_t coef[64]) {
+    std::memset(coef, 0, 64 * sizeof(int32_t));
+    int s = huff_decode(br, hdc);
     if (s < 0 || s > 11) return -1;
     int diff = 0;
     if (s) {
@@ -1138,10 +1487,9 @@ int decode_block(BitReader& br, int table, const uint16_t dq[64], int& dc_pred, 
     int32_t v = dc_pred * int32_t(dq[0]);
     coef[0] = std::min<int32_t>(2047, std::max<int32_t>(-2048, v));
 
-    const HuffDec& ac = ht.dec_ac[table];
     int has_ac = 0;
     for (int k = 1; k < 64;) {
-        int rs = huff_decode(br, ac);
+        int rs = huff_decode(br, hac);
         if (rs < 0) return -1;
         int r = rs >> 4;
         s = rs & 15;
@@ -1160,6 +1508,42 @@ int decode_block(BitReader& br, int table, const uint16_t dq[64], int& dc_pred, 
         ++k;
     }
     return has_ac;
+}
+
+int decode_block(BitReader& br, int table, const uint16_t dq[64], int& dc_pred, int32_t coef[64]) {
+    const HuffSet& s = standard_huff();
+    return decode_block(br, s.dec[table * 2], s.dec[table * 2 + 1], dq, dc_pred, coef);
+}
+
+void predict_block(const uint8_t* plane, int stride, int x, int y, int mvx, int mvy, int w, int h, uint8_t* out,
+                   int ostride) {
+    const uint8_t* s = plane + size_t(y + (mvy >> 1)) * size_t(stride) + size_t(x + (mvx >> 1));
+    const size_t st = size_t(stride);
+    const int fx = mvx & 1, fy = mvy & 1;
+    for (int r = 0; r < h; ++r, s += st, out += ostride) {
+        if (!fx && !fy) {
+            std::memcpy(out, s, size_t(w));
+        } else if (fx && !fy) {
+            for (int i = 0; i < w; ++i) out[i] = uint8_t((s[i] + s[i + 1] + 1) >> 1);
+        } else if (!fx) {
+            for (int i = 0; i < w; ++i) out[i] = uint8_t((s[i] + s[i + st] + 1) >> 1);
+        } else {
+            for (int i = 0; i < w; ++i) out[i] = uint8_t((s[i] + s[i + 1] + s[i + st] + s[i + st + 1] + 2) >> 2);
+        }
+    }
+}
+
+bool mv_in_bounds(const Layout& l, int tile, int mvx, int mvy) {
+    for (int c = 0; c < 3; ++c) {
+        int x, y, w, h;
+        tile_rect(l, tile, c, x, y, w, h);
+        if (w <= 0 || h <= 0) continue;
+        int mx = c ? chroma_mv(mvx) : mvx, my = c ? chroma_mv(mvy) : mvy;
+        int pw = c ? l.pcwidth : l.pwidth, ph = c ? l.pcheight : l.pheight;
+        int ix = x + (mx >> 1), iy = y + (my >> 1);
+        if (ix < 0 || iy < 0 || ix + w + (mx & 1) > pw || iy + h + (my & 1) > ph) return false;
+    }
+    return true;
 }
 
 void pack_bitmap(const uint8_t* flags, int n, uint8_t* out) {
@@ -1421,6 +1805,81 @@ int decode_frame(const uint8_t* data, size_t size, int channels, uint32_t rate, 
 }  // namespace detail
 
 // ---------------------------------------------------------------------------
+// SyncTracker
+// ---------------------------------------------------------------------------
+void SyncTracker::reset(const Layout& l) {
+    l_ = l;
+    root_.assign(size_t(l.tiles), 0);
+    next_.clear();
+    counts_.assign(1, std::make_pair(uint32_t(0), uint32_t(l.tiles)));
+}
+
+void SyncTracker::count_add(uint32_t root, int delta) {
+    auto it = std::lower_bound(counts_.begin(), counts_.end(), std::make_pair(root, uint32_t(0)));
+    if (it != counts_.end() && it->first == root) {
+        it->second = uint32_t(int64_t(it->second) + delta);
+        if (it->second == 0) counts_.erase(it);
+    } else {
+        counts_.insert(it, std::make_pair(root, uint32_t(delta)));
+    }
+}
+
+uint32_t SyncTracker::sync_point() const { return counts_.empty() ? 0 : counts_.front().first; }
+
+uint32_t SyncTracker::ref_root(int tile, int mvx, int mvy) const {
+    // Bounding box, in tiles, of everything the vector reads: the luma area and the
+    // chroma area mapped back to the tiles that own those chroma samples.
+    int cx0, cx1, cy0, cy1;
+    {
+        int x, y, w, h;
+        tile_rect(l_, tile, 0, x, y, w, h);
+        int lx = x + (mvx >> 1), ly = y + (mvy >> 1);
+        cx0 = lx / l_.tile_w;
+        cx1 = (lx + w - 1 + (mvx & 1)) / l_.tile_w;
+        cy0 = ly / l_.tile_h;
+        cy1 = (ly + h - 1 + (mvy & 1)) / l_.tile_h;
+    }
+    {
+        int x, y, w, h;
+        tile_rect(l_, tile, 1, x, y, w, h);
+        if (w > 0 && h > 0) {
+            int cmx = detail::chroma_mv(mvx), cmy = detail::chroma_mv(mvy);
+            int sx = x + (cmx >> 1), sy = y + (cmy >> 1);
+            cx0 = std::min(cx0, 2 * sx / l_.tile_w);
+            cx1 = std::max(cx1, 2 * (sx + w - 1 + (cmx & 1)) / l_.tile_w);
+            cy0 = std::min(cy0, 2 * sy / l_.tile_h);
+            cy1 = std::max(cy1, 2 * (sy + h - 1 + (cmy & 1)) / l_.tile_h);
+        }
+    }
+    cx0 = std::max(cx0, 0);
+    cy0 = std::max(cy0, 0);
+    cx1 = std::min(cx1, l_.cols - 1);
+    cy1 = std::min(cy1, l_.rows - 1);
+    uint32_t r = root_[size_t(tile)];
+    for (int ty = cy0; ty <= cy1; ++ty)
+        for (int tx = cx0; tx <= cx1; ++tx) r = std::min(r, root_[size_t(ty * l_.cols + tx)]);
+    return r;
+}
+
+uint32_t SyncTracker::add_frame(uint32_t frame, const TileInfo* info) {
+    // New roots are computed from the previous frame's state, then applied.
+    next_.clear();
+    for (int t = 0; t < l_.tiles; ++t) {
+        const TileInfo& ti = info[size_t(t)];
+        if (ti.mode == 1) next_.push_back(uint32_t(t)), next_.push_back(frame);
+        else if (ti.mode == 2) next_.push_back(uint32_t(t)), next_.push_back(ref_root(t, ti.mvx, ti.mvy));
+    }
+    for (size_t i = 0; i < next_.size(); i += 2) {
+        uint32_t t = next_[i], r = next_[i + 1];
+        if (root_[t] == r) continue;
+        count_add(root_[t], -1);
+        count_add(r, +1);
+        root_[t] = r;
+    }
+    return sync_point();
+}
+
+// ---------------------------------------------------------------------------
 // Decoder
 // ---------------------------------------------------------------------------
 Status Decoder::read_header(ReadFn fn, void* user) {
@@ -1429,7 +1888,7 @@ Status Decoder::read_header(ReadFn fn, void* user) {
     size_t n = read_full(fn, user, buf, kStreamHeaderSizeV1);
     if (n == 0) return Status::EndOfStream;
     if (n < size_t(kStreamHeaderSizeV1)) return Status::Truncated;
-    if (buf[3] == '2') {
+    if (buf[3] != '1') {
         n += read_full(fn, user, buf + n, size_t(kStreamHeaderSize - kStreamHeaderSizeV1));
         if (n < size_t(kStreamHeaderSize)) return Status::Truncated;
     }
@@ -1444,9 +1903,16 @@ Status Decoder::read_header(ReadFn fn, void* user) {
         dq_[0][k] = ql[detail::kZigzag[k]];
         dq_[1][k] = qc[detail::kZigzag[k]];
     }
+    huff_ = detail::standard_huff();
     if (!fb_.alloc(layout_)) return Status::OutOfMemory;
+    if (header_.flags & kFlagMotion) {
+        if (!ref_.alloc(layout_)) return Status::OutOfMemory;
+    } else {
+        ref_ = Planes();
+    }
     try {
         dirty_.assign(size_t(layout_.tiles), 0);
+        info_.assign(size_t(layout_.tiles), TileInfo());
         bitmap_.assign(size_t(layout_.tiles + 7) / 8, 0);
         audio_.clear();
     } catch (...) {
@@ -1500,28 +1966,67 @@ Status Decoder::decode_audio(ReadFn fn, void* user, size_t* bytes, bool apply) {
     return Status::Ok;
 }
 
-bool Decoder::decode_tile(const uint8_t* data, size_t size, int tile) {
+bool Decoder::decode_tile(const uint8_t* data, size_t size, int tile, bool apply, int& last_row, TileInfo& last) {
     detail::BitReader br(data, size);
+    TileInfo ti;
+    ti.mode = 1;
+    bool residual = true;
+    const int row = tile / layout_.cols;
+    if (header_.flags & kFlagMotion) {
+        if (br.get(1)) {
+            int dx, dy;
+            if (!detail::get_se(br, &dx) || !detail::get_se(br, &dy)) return false;
+            bool pred = last_row == row && last.mode == 2;
+            int mvx = (pred ? last.mvx : 0) + dx, mvy = (pred ? last.mvy : 0) + dy;
+            if (mvx < -32768 || mvx > 32767 || mvy < -32768 || mvy > 32767) return false;
+            if (!detail::mv_in_bounds(layout_, tile, mvx, mvy)) return false;
+            ti.mode = 2;
+            ti.mvx = int16_t(mvx);
+            ti.mvy = int16_t(mvy);
+            residual = br.get(1) != 0;
+        }
+    }
+    info_[size_t(tile)] = ti;
+    last_row = row;
+    last = ti;
+    if (!apply) return !br.overrun();
+
     int32_t coef[64];
-    uint8_t blk[64];
+    uint8_t blk[64], pred[64];
     for (int c = 0; c < 3; ++c) {
         int x0, y0, w, h;
         tile_rect(layout_, tile, c, x0, y0, w, h);
-        int stride = fb_.stride[c];
-        int table = c ? 1 : 0;
-        int pred = 0;
+        const int stride = fb_.stride[c];
+        const int table = c ? 1 : 0;
+        const detail::HuffDec& hdc = huff_.dec[c ? 2 : 0];
+        const detail::HuffDec& hac = huff_.dec[c ? 3 : 1];
+        const int mx = c ? detail::chroma_mv(ti.mvx) : ti.mvx, my = c ? detail::chroma_mv(ti.mvy) : ti.mvy;
+        int dcp = 0;
         for (int by = 0; by < h; by += 8) {
             for (int bx = 0; bx < w; bx += 8) {
-                int r = detail::decode_block(br, table, dq_[table], pred, coef);
-                if (r < 0) return false;
                 uint8_t* dst = fb_.p[c].data() + size_t(y0 + by) * stride + x0 + bx;
-                int bw = std::min(8, w - bx), bh = std::min(8, h - by);
-                if (bw == 8 && bh == 8) {
-                    if (r) detail::idct8x8(coef, dst, stride);
-                    else detail::idct8x8_dc(coef[0], dst, stride);
+                const int bw = std::min(8, w - bx), bh = std::min(8, h - by);
+                const bool full = bw == 8 && bh == 8;
+                if (ti.mode == 1) {
+                    int r = detail::decode_block(br, hdc, hac, dq_[table], dcp, coef);
+                    if (r < 0) return false;
+                    uint8_t* out = full ? dst : blk;
+                    int os = full ? stride : 8;
+                    if (r) detail::idct8x8(coef, out, os);
+                    else detail::idct8x8_dc(coef[0], out, os);
+                    if (!full) store_partial_block(blk, dst, stride, bw, bh);
+                    continue;
+                }
+                detail::predict_block(ref_.p[c].data(), stride, x0 + bx, y0 + by, mx, my, bw, bh, pred, 8);
+                if (!residual) {
+                    store_partial_block(pred, dst, stride, bw, bh);
+                    continue;
+                }
+                if (detail::decode_block(br, hdc, hac, dq_[table], dcp, coef) < 0) return false;
+                if (full) {
+                    detail::idct8x8_add(coef, pred, 8, dst, stride);
                 } else {
-                    if (r) detail::idct8x8(coef, blk, 8);
-                    else detail::idct8x8_dc(coef[0], blk, 8);
+                    detail::idct8x8_add(coef, pred, 8, blk, 8);
                     store_partial_block(blk, dst, stride, bw, bh);
                 }
             }
@@ -1538,9 +2043,26 @@ Status Decoder::decode_frame(ReadFn fn, void* user, FrameStats* stats, bool appl
     if (n < sizeof(hdr)) return Status::Truncated;
 
     uint32_t frame_num = get_u32(hdr);
-    if (hdr[4] > 1) return Status::Corrupt;
-    bool force = hdr[4] != 0;
+    uint8_t allowed = kFrameForceRefresh;
+    if (header_.flags & kFlagAdaptiveHuffman) allowed |= kFrameTables;
+    if (hdr[4] & ~allowed) return Status::Corrupt;
+    bool force = (hdr[4] & kFrameForceRefresh) != 0;
     size_t bytes = kFrameHeaderSize;
+
+    bool tables = (hdr[4] & kFrameTables) != 0;
+    if (tables) {
+        detail::HuffSet hs;
+        for (int i = 0; i < 4; ++i) {
+            if (read_full(fn, user, hs.spec[i].bits, 16) < 16) return Status::Truncated;
+            int count = hs.spec[i].count();
+            if (count < 1 || count > 256) return Status::Corrupt;
+            if (read_full(fn, user, hs.spec[i].vals, size_t(count)) < size_t(count)) return Status::Truncated;
+            bytes += 16 + size_t(count);
+        }
+        if (!hs.build()) return Status::Corrupt;
+        huff_ = hs;
+    }
+
     if (force) {
         std::fill(dirty_.begin(), dirty_.end(), uint8_t(1));
     } else {
@@ -1549,9 +2071,14 @@ Status Decoder::decode_frame(ReadFn fn, void* user, FrameStats* stats, bool appl
         bytes += bitmap_.size();
     }
 
-    uint32_t dirty_count = 0;
+    uint32_t dirty_count = 0, inter = 0;
+    int last_row = -1;
+    TileInfo last;
     for (int t = 0; t < layout_.tiles; ++t) {
-        if (!dirty_[size_t(t)]) continue;
+        if (!dirty_[size_t(t)]) {
+            info_[size_t(t)] = TileInfo();
+            continue;
+        }
         uint8_t lb[2];
         if (read_full(fn, user, lb, 2) < 2) return Status::Truncated;
         size_t len = get_u16(lb);
@@ -1564,9 +2091,25 @@ Status Decoder::decode_frame(ReadFn fn, void* user, FrameStats* stats, bool appl
             }
         }
         if (read_full(fn, user, payload_.data(), len) < len) return Status::Truncated;
-        if (apply && !decode_tile(payload_.data(), len, t)) return Status::Corrupt;
+        if (!decode_tile(payload_.data(), len, t, apply, last_row, last)) return Status::Corrupt;
+        inter += info_[size_t(t)].mode == 2;
         bytes += 2 + len;
         ++dirty_count;
+    }
+
+    // The next frame predicts from this one: bring the changed tiles over.
+    if (apply && (header_.flags & kFlagMotion)) {
+        for (int t = 0; t < layout_.tiles; ++t) {
+            if (!dirty_[size_t(t)]) continue;
+            for (int c = 0; c < 3; ++c) {
+                int x, y, w, h;
+                tile_rect(layout_, t, c, x, y, w, h);
+                for (int r = 0; r < h; ++r) {
+                    size_t off = size_t(y + r) * fb_.stride[c] + x;
+                    std::memcpy(ref_.p[c].data() + off, fb_.p[c].data() + off, size_t(w));
+                }
+            }
+        }
     }
 
     size_t video_bytes = bytes;
@@ -1580,6 +2123,9 @@ Status Decoder::decode_frame(ReadFn fn, void* user, FrameStats* stats, bool appl
         stats->force_refresh = force;
         stats->dirty_tiles = dirty_count;
         stats->total_tiles = uint32_t(layout_.tiles);
+        stats->inter_tiles = inter;
+        stats->dropped_tiles = 0;
+        stats->tables = tables;
         stats->bytes = bytes;
         stats->audio_samples = uint32_t(audio_samples_);
         stats->audio_bytes = header_.audio_codec ? bytes - video_bytes - 4 : 0;
@@ -1594,6 +2140,55 @@ void Decoder::copy_frame(uint8_t* dst) const { copy_cropped(fb_, layout_, dst); 
 // Encoder
 // ---------------------------------------------------------------------------
 #ifndef TJC_NO_ENCODER
+
+struct Encoder::Scratch {
+    std::vector<detail::Token> intra, inter, resid;
+    std::vector<uint8_t> save[3], intra_rec[3];
+    std::vector<uint8_t> pred;  // luma prediction for half-pel search
+    // Vectors already evaluated for the current tile (open addressing, stamped).
+    uint32_t seen_key[512] = {};
+    uint32_t seen_stamp[512] = {};
+    uint32_t stamp = 0;
+    uint64_t best_sad = 0;  // luma SAD of the vector search_motion() returned
+};
+
+namespace {
+
+void save_tile(const Layout& l, const Planes& p, int t, std::vector<uint8_t>* dst) {
+    for (int c = 0; c < 3; ++c) {
+        dst[c].clear();
+        int x, y, w, h;
+        tile_rect(l, t, c, x, y, w, h);
+        for (int r = 0; r < h; ++r) {
+            const uint8_t* q = p.p[c].data() + size_t(y + r) * p.stride[c] + x;
+            dst[c].insert(dst[c].end(), q, q + w);
+        }
+    }
+}
+
+void load_tile(const Layout& l, Planes& p, int t, const std::vector<uint8_t>* src) {
+    for (int c = 0; c < 3; ++c) {
+        int x, y, w, h;
+        tile_rect(l, t, c, x, y, w, h);
+        if (w <= 0 || h <= 0) continue;
+        for (int r = 0; r < h; ++r)
+            std::memcpy(p.p[c].data() + size_t(y + r) * p.stride[c] + x, &src[c][size_t(r) * size_t(w)], size_t(w));
+    }
+}
+
+inline void raw_token(std::vector<detail::Token>& out, uint32_t bits, int n) {
+    out.push_back({detail::kRawToken, 0, uint8_t(n), bits});
+}
+
+void se_tokens(std::vector<detail::Token>& out, int v) {
+    uint32_t k = v > 0 ? uint32_t(2 * v - 1) : uint32_t(-2 * v);
+    int m = bit_count(int(k + 1));
+    if (m > 1) raw_token(out, 0, m - 1);
+    raw_token(out, k + 1, m);
+}
+
+}  // namespace
+
 bool Encoder::init(const Config& cfg) {
     ready_ = false;
     if (const char* e = validate_geometry(cfg.width, cfg.height, cfg.tile_w, cfg.tile_h)) {
@@ -1621,21 +2216,57 @@ bool Encoder::init(const Config& cfg) {
         error_ = "audio needs 1..8 channels and a sample rate of 1..16777215 Hz";
         return false;
     }
+    if (!(cfg.deadzone >= 0 && cfg.deadzone <= 0.5) || !(cfg.skip_invisible >= 0) || cfg.motion_range < 1 ||
+        cfg.motion_range > 1024 || cfg.effort < 0 || cfg.effort > 2) {
+        error_ = "deadzone must be 0..0.5, skip_invisible >= 0, motion_range 1..1024, effort 0..2";
+        return false;
+    }
     cfg_ = cfg;
     layout_ = make_layout(cfg.width, cfg.height, cfg.tile_w, cfg.tile_h);
-    if (!cur_.alloc(layout_) || !last_coded_.alloc(layout_) || !recon_.alloc(layout_)) {
+    if (!cur_.alloc(layout_) || !last_coded_.alloc(layout_) || !recon_.alloc(layout_) ||
+        (cfg.motion && !ref_.alloc(layout_))) {
         error_ = "out of memory";
         return false;
     }
-    dirty_.assign(size_t(layout_.tiles), 0);
-    dirty_list_.clear();
     detail::build_quant_tables(cfg.quality, q_[0], q_[1]);
+    double qmean = 0;
     for (int t = 0; t < 2; ++t) {
         for (int k = 0; k < 64; ++k) {
-            qdiv_[t][k] = uint32_t(q_[t][detail::kZigzag[k]]) * 8;
-            qrecip_[t][k] = detail::quant_recip(qdiv_[t][k]);
+            uint32_t d = uint32_t(q_[t][detail::kZigzag[k]]) * 8;
+            qrecip_[t][k] = detail::quant_recip(d);
+            qround_[t][k] = k ? uint32_t(double(d) * cfg.deadzone) : d / 2;
         }
     }
+    for (int k = 0; k < 64; ++k) qmean += q_[0][k];
+    qmean /= 64;
+    lambda_ = 0.15 * qmean * qmean;
+
+    header_ = StreamHeader();
+    header_.width = cfg.width;
+    header_.height = cfg.height;
+    header_.tile_w = cfg.tile_w;
+    header_.tile_h = cfg.tile_h;
+    header_.refresh_mode = cfg.refresh_mode;
+    header_.refresh_param = uint16_t(cfg.refresh_param);
+    header_.quality = cfg.quality;
+    header_.version = cfg.motion || cfg.adaptive_huffman ? 3 : 2;
+    header_.flags = uint8_t((cfg.adaptive_huffman ? kFlagAdaptiveHuffman : 0) | (cfg.motion ? kFlagMotion : 0));
+    header_.fps_num = cfg.fps_num;
+    header_.fps_den = cfg.fps_den;
+    header_.audio_codec = cfg.audio_channels ? 1 : 0;
+    header_.audio_channels = cfg.audio_channels;
+    header_.audio_rate = cfg.audio_rate;
+
+    huff_ = detail::standard_huff();
+    std::memset(hist_, 0, sizeof(hist_));
+    sync_.reset(layout_);
+    const size_t tiles = size_t(layout_.tiles);
+    dirty_.assign(tiles, 0);
+    rolling_.assign(tiles, 0);
+    info_.assign(tiles, TileInfo());
+    prev_mvx_.assign(tiles, 0);
+    prev_mvy_.assign(tiles, 0);
+    dirty_list_.clear();
 #ifdef TJC_NO_THREADS
     threads_ = 1;
 #else
@@ -1643,7 +2274,9 @@ bool Encoder::init(const Config& cfg) {
     threads_ = std::max(1, std::min(threads_, 256));
 #endif
     worker_out_.assign(size_t(threads_), std::vector<uint8_t>());
+    worker_tokens_.assign(size_t(threads_), std::vector<detail::Token>());
     policy_.reset(cfg.refresh_mode, cfg.refresh_param, layout_.tiles);
+    roll_cursor_ = 0;
     frame_num_ = 0;
     frame_index_ = 0;
     keyframe_request_ = false;
@@ -1675,24 +2308,7 @@ void Encoder::parallel_for(int n, int min_per_thread, F fn) {
 #endif
 }
 
-StreamHeader Encoder::stream_header() const {
-    StreamHeader h;
-    h.width = cfg_.width;
-    h.height = cfg_.height;
-    h.tile_w = cfg_.tile_w;
-    h.tile_h = cfg_.tile_h;
-    h.chroma_format = 0;
-    h.refresh_mode = cfg_.refresh_mode;
-    h.refresh_param = uint16_t(cfg_.refresh_param);
-    h.quality = cfg_.quality;
-    h.version = 2;
-    h.fps_num = cfg_.fps_num;
-    h.fps_den = cfg_.fps_den;
-    h.audio_codec = cfg_.audio_channels ? 1 : 0;
-    h.audio_channels = cfg_.audio_channels;
-    h.audio_rate = cfg_.audio_rate;
-    return h;
-}
+StreamHeader Encoder::stream_header() const { return header_; }
 
 void Encoder::push_audio(const int16_t* interleaved, size_t samples_per_channel) {
     if (!cfg_.audio_channels) return;
@@ -1706,7 +2322,7 @@ size_t Encoder::samples_for_next_frame() const {
 
 void Encoder::write_stream_header(std::vector<uint8_t>& out) const {
     uint8_t buf[kStreamHeaderSize];
-    tjc::write_stream_header(stream_header(), buf);
+    tjc::write_stream_header(header_, buf);
     out.insert(out.end(), buf, buf + kStreamHeaderSize);
 }
 
@@ -1761,56 +2377,381 @@ void Encoder::copy_tile(const Planes& from, Planes& to, int tile) {
     }
 }
 
-void Encoder::encode_tile(int tile, std::vector<uint8_t>& out) {
-    size_t len_pos = out.size();
-    out.push_back(0);
-    out.push_back(0);
-    detail::BitWriter bw(out);
+uint64_t Encoder::tile_sse(int tile) const {
+    uint64_t e = 0;
+    for (int c = 0; c < 3; ++c) {
+        int x, y, w, h;
+        tile_rect(layout_, tile, c, x, y, w, h);
+        int s = cur_.stride[c];
+        for (int r = 0; r < h; ++r) {
+            const uint8_t* a = cur_.p[c].data() + size_t(y + r) * s + x;
+            const uint8_t* b = recon_.p[c].data() + size_t(y + r) * s + x;
+            for (int i = 0; i < w; ++i) {
+                int d = int(a[i]) - int(b[i]);
+                e += uint64_t(d * d);
+            }
+        }
+    }
+    return e;
+}
+
+void Encoder::quantize(const int32_t dct[64], int comp, int16_t zz[64], int32_t deq[64], bool* has_ac) const {
+    const uint16_t* q = q_[comp];
+    const uint64_t* recip = qrecip_[comp];
+    const uint32_t* rnd = qround_[comp];
+    int32_t ac = 0;
+    for (int k = 0; k < 64; ++k) {
+        int nat = detail::kZigzag[k];
+        int32_t v = dct[nat], sign = v >> 31;
+        uint32_t a = uint32_t((v ^ sign) - sign) + rnd[k];
+        int32_t qv = int32_t((a * recip[k]) >> 40);
+        qv = (qv ^ sign) - sign;
+        qv = std::min<int32_t>(1023, std::max<int32_t>(-1023, qv));
+        zz[k] = int16_t(qv);
+        // Same dequantization and clamp as the decoder.
+        deq[nat] = std::min<int32_t>(2047, std::max<int32_t>(-2048, qv * int32_t(q[nat])));
+        if (k) ac |= qv;
+    }
+    *has_ac = ac != 0;
+}
+
+void Encoder::intra_tokens(int tile, Scratch&, std::vector<detail::Token>& out) {
     int32_t dct[64], deq[64];
     int16_t zz[64];
     uint8_t blk[64];
     for (int c = 0; c < 3; ++c) {
         int x0, y0, w, h;
         tile_rect(layout_, tile, c, x0, y0, w, h);
-        int stride = cur_.stride[c];
-        int table = c ? 1 : 0;
-        const uint16_t* q = q_[table];
-        const uint32_t* qdiv = qdiv_[table];
-        const uint64_t* qrecip = qrecip_[table];
-        int pred = 0;
+        const int stride = cur_.stride[c], comp = c ? 1 : 0;
+        int dcp = 0;
         for (int by = 0; by < h; by += 8) {
             for (int bx = 0; bx < w; bx += 8) {
                 size_t off = size_t(y0 + by) * stride + x0 + bx;
-                int bw_ = std::min(8, w - bx), bh_ = std::min(8, h - by);
-                bool full = bw_ == 8 && bh_ == 8;
+                int bw = std::min(8, w - bx), bh = std::min(8, h - by);
+                bool full = bw == 8 && bh == 8;
                 if (full) {
                     detail::fdct8x8(cur_.p[c].data() + off, stride, dct);
                 } else {
-                    load_partial_block(cur_.p[c].data() + off, stride, bw_, bh_, blk);
+                    load_partial_block(cur_.p[c].data() + off, stride, bw, bh, blk);
                     detail::fdct8x8(blk, 8, dct);
                 }
-                int32_t ac_bits = 0;  // OR of the AC values, branch-free
-                for (int k = 0; k < 64; ++k) {
-                    int nat = detail::kZigzag[k];
-                    int32_t qv = detail::quant_div(dct[nat], qdiv[k], qrecip[k]);
-                    qv = std::min<int32_t>(1023, std::max<int32_t>(-1023, qv));
-                    zz[k] = int16_t(qv);
-                    // Shadow decode: same dequantization and clamp as decode_block().
-                    deq[nat] = std::min<int32_t>(2047, std::max<int32_t>(-2048, qv * int32_t(q[nat])));
-                    if (k) ac_bits |= qv;
-                }
-                bool has_ac = ac_bits != 0;
-                detail::encode_block(bw, zz, pred, table);
+                bool has_ac;
+                quantize(dct, comp, zz, deq, &has_ac);
+                detail::tokenize_block(zz, dcp, comp, out);
                 uint8_t* dst = full ? recon_.p[c].data() + off : blk;
-                int dstride = full ? stride : 8;
-                if (has_ac) detail::idct8x8(deq, dst, dstride);
-                else detail::idct8x8_dc(deq[0], dst, dstride);
-                if (!full) store_partial_block(blk, recon_.p[c].data() + off, stride, bw_, bh_);
+                int ds = full ? stride : 8;
+                if (has_ac) detail::idct8x8(deq, dst, ds);
+                else detail::idct8x8_dc(deq[0], dst, ds);
+                if (!full) store_partial_block(blk, recon_.p[c].data() + off, stride, bw, bh);
             }
         }
     }
-    bw.flush();
-    put_u16(out.data() + len_pos, uint32_t(out.size() - len_pos - 2));
+}
+
+// Motion compensated residual of a tile. Writes the reconstruction (prediction +
+// coded residual) and the residual block tokens; returns whether any coefficient
+// is non-zero (if not, the tile is coded as a plain copy).
+bool Encoder::inter_tokens(int tile, int mvx, int mvy, Scratch&, std::vector<detail::Token>& out) {
+    int32_t dct[64], deq[64];
+    int16_t zz[64], res[64];
+    uint8_t pred[64], blk[64];
+    bool nonzero = false;
+    for (int c = 0; c < 3; ++c) {
+        int x0, y0, w, h;
+        tile_rect(layout_, tile, c, x0, y0, w, h);
+        const int stride = cur_.stride[c], comp = c ? 1 : 0;
+        const int mx = c ? detail::chroma_mv(mvx) : mvx, my = c ? detail::chroma_mv(mvy) : mvy;
+        int dcp = 0;
+        for (int by = 0; by < h; by += 8) {
+            for (int bx = 0; bx < w; bx += 8) {
+                size_t off = size_t(y0 + by) * stride + x0 + bx;
+                int bw = std::min(8, w - bx), bh = std::min(8, h - by);
+                detail::predict_block(ref_.p[c].data(), stride, x0 + bx, y0 + by, mx, my, bw, bh, pred, 8);
+                for (int r = 0; r < 8; ++r) {
+                    int rr = std::min(r, bh - 1);
+                    const uint8_t* s = cur_.p[c].data() + off + size_t(rr) * stride;
+                    for (int i = 0; i < 8; ++i) {
+                        int ii = std::min(i, bw - 1);
+                        res[r * 8 + i] = int16_t(int(s[ii]) - int(pred[rr * 8 + ii]));
+                    }
+                }
+                detail::fdct8x8_residual(res, 8, dct);
+                bool has_ac;
+                quantize(dct, comp, zz, deq, &has_ac);
+                for (int k = 0; k < 64 && !nonzero; ++k) nonzero = zz[k] != 0;
+                detail::tokenize_block(zz, dcp, comp, out);
+                if (bw == 8 && bh == 8) {
+                    detail::idct8x8_add(deq, pred, 8, recon_.p[c].data() + off, stride);
+                } else {
+                    detail::idct8x8_add(deq, pred, 8, blk, 8);
+                    store_partial_block(blk, recon_.p[c].data() + off, stride, bw, bh);
+                }
+            }
+        }
+    }
+    return nonzero;
+}
+
+void Encoder::search_motion(int tile, int pmvx, int pmvy, Scratch& s, int& out_x, int& out_y) {
+    int x0, y0, w, h;
+    tile_rect(layout_, tile, 0, x0, y0, w, h);
+    const int stride = cur_.stride[0];
+    const double lam = std::sqrt(lambda_);  // SAD-domain weight for vector bits
+    uint32_t window = cfg_.sync_window;
+    if (!window) {
+        if (cfg_.refresh_mode == RefreshMode::Rolling && cfg_.refresh_param)
+            window = 2 * uint32_t((layout_.tiles + int(cfg_.refresh_param) - 1) / int(cfg_.refresh_param));
+        else if (cfg_.refresh_mode == RefreshMode::FullPeriodic)
+            window = cfg_.refresh_param;
+    }
+    const uint32_t min_root = window && frame_index_ > window ? frame_index_ - window : 0;
+
+    double best = 1e300;
+    uint64_t best_sad = 0;
+    int bx = 0, by = 0;
+    bool any = false;
+    auto valid = [&](int mx, int my) {
+        if (mx < -2 * cfg_.motion_range || mx > 2 * cfg_.motion_range || my < -2 * cfg_.motion_range ||
+            my > 2 * cfg_.motion_range)
+            return false;
+        if (!detail::mv_in_bounds(layout_, tile, mx, my)) return false;
+        return min_root == 0 || sync_.ref_root(tile, mx, my) >= min_root;
+    };
+    uint64_t last_sad = 0;
+    auto cost_of = [&](int mx, int my) -> double {
+        double vb = lam * double(detail::se_bits(mx - pmvx) + detail::se_bits(my - pmvy));
+        uint64_t limit = best >= 1e299 ? ~uint64_t(0) : uint64_t(std::max(0.0, best - vb)) + 1;
+        uint64_t sad;
+        if (!(mx & 1) && !(my & 1)) {
+            const uint8_t* a = cur_.p[0].data() + size_t(y0) * stride + x0;
+            const uint8_t* b = ref_.p[0].data() + size_t(y0 + (my >> 1)) * stride + x0 + (mx >> 1);
+            sad = detail::sad(a, stride, b, stride, w, h, limit);
+        } else {
+            s.pred.resize(size_t(w) * size_t(h));
+            detail::predict_block(ref_.p[0].data(), stride, x0, y0, mx, my, w, h, s.pred.data(), w);
+            sad = detail::sad(cur_.p[0].data() + size_t(y0) * stride + x0, stride, s.pred.data(), w, w, h, limit);
+        }
+        last_sad = sad;
+        return double(sad) + vb;
+    };
+    if (++s.stamp == 0) {
+        std::memset(s.seen_stamp, 0, sizeof(s.seen_stamp));
+        s.stamp = 1;
+    }
+    auto test = [&](int mx, int my) {
+        uint32_t key = (uint32_t(mx + 32768) << 16) | uint32_t(my + 32768);
+        for (uint32_t i = (key * 2654435761u) >> 23;; i = (i + 1) & 511) {
+            if (s.seen_stamp[i] != s.stamp) {
+                s.seen_stamp[i] = s.stamp;
+                s.seen_key[i] = key;
+                break;
+            }
+            if (s.seen_key[i] == key) return;  // already evaluated
+        }
+        if (!valid(mx, my)) return;
+        double c = cost_of(mx, my);
+        if (c < best) {
+            best = c;
+            best_sad = last_sad;
+            bx = mx;
+            by = my;
+            any = true;
+        }
+    };
+
+    // Candidates: no motion, the row predictor, and last frame's vectors around here.
+    test(0, 0);
+    test(pmvx & ~1, pmvy & ~1);
+    const int col = tile % layout_.cols, row = tile / layout_.cols;
+    const int nb[5] = {tile, col > 0 ? tile - 1 : -1, col + 1 < layout_.cols ? tile + 1 : -1,
+                       row > 0 ? tile - layout_.cols : -1, row + 1 < layout_.rows ? tile + layout_.cols : -1};
+    for (int n : nb)
+        if (n >= 0) test(prev_mvx_[size_t(n)] & ~1, prev_mvy_[size_t(n)] & ~1);
+    if (!any) {
+        out_x = out_y = INT32_MIN;
+        return;
+    }
+    if (best <= lam * 2) {  // a perfect match (static content): nothing to refine
+        out_x = bx;
+        out_y = by;
+        s.best_sad = best_sad;
+        return;
+    }
+    // A coarse grid only when even the best candidate is poor: well above the
+    // difference grain alone causes (a few levels per pixel). Then refine.
+    if (best > double(w * h) * (cfg_.effort >= 2 ? 2.0 : 6.0)) {
+        const int r = cfg_.motion_range;
+        const int step = std::max(2, r / 4) & ~1;
+        for (int my = -r; my <= r; my += step)
+            for (int mx = -r; mx <= r; mx += step) test(2 * mx, 2 * my);
+    }
+    for (int step : {8, 4, 2}) {
+        for (int it = 0; it < 32; ++it) {
+            int cx = bx, cy = by;
+            test(cx + step, cy);
+            test(cx - step, cy);
+            test(cx, cy + step);
+            test(cx, cy - step);
+            if (cx == bx && cy == by) break;
+        }
+    }
+    // Half-pel refinement.
+    {
+        int cx = bx, cy = by;
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx)
+                if (dx || dy) test(cx + dx, cy + dy);
+    }
+    out_x = bx;
+    out_y = by;
+    s.best_sad = best_sad;
+}
+
+void Encoder::code_tile(int tile, bool allow_inter, bool may_drop, int pmvx, int pmvy, Scratch& s, TileCode& tc) {
+    std::vector<detail::Token>& toks = worker_tokens_[size_t(tc.worker)];
+    tc.tok_begin = tc.tok_end = toks.size();
+    tc.dropped = false;
+    tc.info = TileInfo();
+    tc.info.mode = 1;
+    if (may_drop) save_tile(layout_, recon_, tile, s.save);
+
+    int mvx = INT32_MIN, mvy = INT32_MIN;
+    if (allow_inter) search_motion(tile, pmvx, pmvy, s, mvx, mvy);
+    // When the motion match is already close (a few levels per pixel), intra
+    // practically never wins: skip trying it.
+    int x0, y0, w, h;
+    tile_rect(layout_, tile, 0, x0, y0, w, h);
+    static const double kInterOnly[3] = {4.0, 1.5, -1.0};  // mean |diff| per pixel, by effort
+    const bool inter_only = mvx != INT32_MIN && double(s.best_sad) <= double(w) * double(h) * kInterOnly[cfg_.effort];
+
+    s.intra.clear();
+    double j_intra = 1e300;
+    if (!inter_only) {
+        if (cfg_.motion) raw_token(s.intra, 0, 1);
+        intra_tokens(tile, s, s.intra);
+        if (mvx != INT32_MIN) {
+            j_intra = double(tile_sse(tile)) + lambda_ * double(detail::token_bits(s.intra.data(), s.intra.size(), huff_));
+            save_tile(layout_, recon_, tile, s.intra_rec);
+        }
+    }
+    const std::vector<detail::Token>* chosen = &s.intra;
+
+    if (mvx != INT32_MIN) {
+        {
+            s.resid.clear();
+            bool coded = inter_tokens(tile, mvx, mvy, s, s.resid);
+            s.inter.clear();
+            raw_token(s.inter, 1, 1);
+            se_tokens(s.inter, mvx - pmvx);
+            se_tokens(s.inter, mvy - pmvy);
+            raw_token(s.inter, coded ? 1 : 0, 1);
+            if (coded) s.inter.insert(s.inter.end(), s.resid.begin(), s.resid.end());
+            double j_inter =
+                double(tile_sse(tile)) + lambda_ * double(detail::token_bits(s.inter.data(), s.inter.size(), huff_));
+            if (j_inter < j_intra) {
+                chosen = &s.inter;
+                tc.info.mode = 2;
+                tc.info.mvx = int16_t(mvx);
+                tc.info.mvy = int16_t(mvy);
+            } else {
+                load_tile(layout_, recon_, tile, s.intra_rec);
+            }
+        }
+    }
+
+    if (may_drop) {
+        // Would the viewer see the update? Compare the new picture with the old one.
+        bool visible = false;
+        for (int c = 0; c < 3 && !visible; ++c) {
+            int x, y, w, h;
+            tile_rect(layout_, tile, c, x, y, w, h);
+            const int stride = recon_.stride[c];
+            for (int by = 0; by < h && !visible; by += 8) {
+                for (int bx = 0; bx < w && !visible; bx += 8) {
+                    int bw = std::min(8, w - bx), bh = std::min(8, h - by);
+                    uint64_t limit = uint64_t(cfg_.skip_invisible * bw * bh);
+                    uint64_t d = detail::sad(recon_.p[c].data() + size_t(y + by) * stride + x + bx, stride,
+                                             &s.save[c][size_t(by) * size_t(w) + size_t(bx)], w, bw, bh, limit);
+                    visible = d > limit;
+                }
+            }
+        }
+        if (!visible) {
+            load_tile(layout_, recon_, tile, s.save);
+            tc.dropped = true;
+            tc.info = TileInfo();
+            return;
+        }
+    }
+    toks.insert(toks.end(), chosen->begin(), chosen->end());
+    tc.tok_end = toks.size();
+}
+
+void Encoder::pick_refresh(uint8_t* rolling) {
+    if (cfg_.refresh_mode != RefreshMode::Rolling || cfg_.refresh_param == 0) return;
+    const int tiles = layout_.tiles;
+    const uint32_t n = std::min<uint32_t>(cfg_.refresh_param, uint32_t(tiles));
+    if (!cfg_.smart_refresh) {
+        for (uint32_t i = 0; i < n; ++i) {
+            rolling[roll_cursor_] = 1;
+            dirty_[size_t(roll_cursor_)] = 1;
+            if (++roll_cursor_ == tiles) roll_cursor_ = 0;
+        }
+        return;
+    }
+    // Only tiles whose content is older than one refresh cycle need it.
+    const uint32_t cycle = uint32_t((tiles + int(cfg_.refresh_param) - 1) / int(cfg_.refresh_param));
+    uint32_t picked = 0;
+    for (int k = 0; k < tiles && picked < n; ++k) {
+        int t = roll_cursor_;
+        if (++roll_cursor_ == tiles) roll_cursor_ = 0;
+        if (dirty_[size_t(t)] && !cfg_.motion) continue;  // sent intra anyway
+        if (frame_index_ - sync_.root(t) < cycle) continue;
+        rolling[t] = 1;
+        dirty_[size_t(t)] = 1;
+        ++picked;
+    }
+}
+
+void Encoder::choose_tables(bool, bool* send) {
+    *send = false;
+    if (!cfg_.adaptive_huffman) return;
+    uint32_t cur[4][256] = {};
+    for (const TileCode& tc : codes_) {
+        const std::vector<detail::Token>& toks = worker_tokens_[size_t(tc.worker)];
+        for (size_t i = tc.tok_begin; i < tc.tok_end; ++i)
+            if (toks[i].table != detail::kRawToken) ++cur[toks[i].table][toks[i].sym];
+    }
+    // Decayed history, plus every symbol the encoder can produce so the tables
+    // stay complete for the frames that follow.
+    detail::HuffSet cand;
+    for (int t = 0; t < 4; ++t) {
+        uint32_t f[256] = {};
+        for (int sym = 0; sym < 256; ++sym) {
+            hist_[t][sym] = hist_[t][sym] - hist_[t][sym] / 4 + cur[t][sym];
+            bool valid = (t & 1) ? (sym == 0 || sym == 0xf0 || ((sym & 15) >= 1 && (sym & 15) <= 10)) : sym <= 11;
+            if (valid) f[sym] = uint32_t(std::min<uint64_t>(hist_[t][sym], 0x3fffffff)) + 1;
+        }
+        cand.spec[t] = detail::optimal_huff(f);
+    }
+    if (!cand.build()) return;
+    // Tables stay in force for the frames that follow, so weigh this frame's saving
+    // over a few frames against the one-off cost of sending them; require a 1% gain
+    // so the tables don't flap.
+    uint64_t old_bits = 0, new_bits = 0, table_bits = 0;
+    for (int t = 0; t < 4; ++t) {
+        table_bits += 8 * uint64_t(16 + cand.spec[t].count());
+        for (int sym = 0; sym < 256; ++sym) {
+            if (!cur[t][sym]) continue;
+            old_bits += uint64_t(cur[t][sym]) * huff_.enc[t].size[sym];
+            new_bits += uint64_t(cur[t][sym]) * cand.enc[t].size[sym];
+        }
+    }
+    const uint64_t kHorizon = 8;
+    if (new_bits < old_bits && (old_bits - new_bits) * kHorizon > table_bits && (old_bits - new_bits) * 100 > old_bits) {
+        huff_ = cand;
+        *send = true;
+    }
 }
 
 void Encoder::encode_frame(const uint8_t* yuv420p, std::vector<uint8_t>& out, FrameStats* stats) {
@@ -1828,44 +2769,113 @@ void Encoder::encode_frame(const uint8_t* y, int ystride, const uint8_t* u, int 
 
     bool force = keyframe_request_ || policy_.forced(frame_index_);
     keyframe_request_ = false;
-    int tiles = layout_.tiles;
-    int tile_area = layout_.tile_w * layout_.tile_h;
+    const int tiles = layout_.tiles;
+    const int tile_area = layout_.tile_w * layout_.tile_h;
+    std::fill(rolling_.begin(), rolling_.end(), uint8_t(0));
     if (force) {
         std::fill(dirty_.begin(), dirty_.end(), uint8_t(1));
     } else {
         parallel_for(tiles, std::max(1, 32768 / tile_area), [this](int b, int e, int) {
             for (int t = b; t < e; ++t) dirty_[size_t(t)] = tile_changed(t) ? 1 : 0;
         });
-        policy_.apply(dirty_.data());
+        pick_refresh(rolling_.data());
     }
     dirty_list_.clear();
     for (int t = 0; t < tiles; ++t)
         if (dirty_[size_t(t)]) dirty_list_.push_back(t);
 
+    // Code the dirty tiles. Workers take whole tile rows (the vector predictor
+    // runs along a row), and their results are joined in raster order, so the
+    // output does not depend on the thread count.
+    codes_.assign(dirty_list_.size(), TileCode());
+    std::vector<size_t> row_start(size_t(layout_.rows) + 1, 0);
+    for (size_t i = 0, r = 0; r <= size_t(layout_.rows); ++r) {
+        while (i < dirty_list_.size() && size_t(dirty_list_[i] / layout_.cols) < r) ++i;
+        row_start[r] = i;
+    }
+    for (auto& w : worker_tokens_) w.clear();
+    const bool can_inter = cfg_.motion && !force;
+    const bool can_drop = cfg_.skip_invisible > 0 && !force;
+    parallel_for(layout_.rows, std::max(1, 4096 / std::max(1, tile_area * layout_.cols)),
+                 [&, this](int r0, int r1, int worker) {
+                     Scratch s;
+                     for (int r = r0; r < r1; ++r) {
+                         int pmvx = 0, pmvy = 0;
+                         for (size_t i = row_start[size_t(r)]; i < row_start[size_t(r) + 1]; ++i) {
+                             const int t = dirty_list_[i];
+                             TileCode& tc = codes_[i];
+                             tc.worker = worker;
+                             const bool keep_intra = rolling_[size_t(t)] != 0;
+                             code_tile(t, can_inter && !keep_intra, can_drop && !keep_intra, pmvx, pmvy, s, tc);
+                             if (tc.dropped) continue;
+                             pmvx = tc.info.mode == 2 ? tc.info.mvx : 0;
+                             pmvy = tc.info.mode == 2 ? tc.info.mvy : 0;
+                         }
+                     }
+                 });
+
+    uint32_t dirty_count = 0, inter = 0, dropped = 0;
+    std::fill(info_.begin(), info_.end(), TileInfo());
+    for (size_t i = 0; i < codes_.size(); ++i) {
+        const int t = dirty_list_[i];
+        if (codes_[i].dropped) {
+            dirty_[size_t(t)] = 0;
+            ++dropped;
+            continue;
+        }
+        info_[size_t(t)] = codes_[i].info;
+        ++dirty_count;
+        inter += codes_[i].info.mode == 2;
+    }
+
+    bool tables = false;
+    choose_tables(force, &tables);
+
     uint8_t hdr[kFrameHeaderSize];
     put_u32(hdr, frame_num_);
-    hdr[4] = force ? 1 : 0;
+    hdr[4] = uint8_t((force ? kFrameForceRefresh : 0) | (tables ? kFrameTables : 0));
     out.insert(out.end(), hdr, hdr + kFrameHeaderSize);
+    if (tables) {
+        for (int t = 0; t < 4; ++t) {
+            out.insert(out.end(), huff_.spec[t].bits, huff_.spec[t].bits + 16);
+            out.insert(out.end(), huff_.spec[t].vals, huff_.spec[t].vals + huff_.spec[t].count());
+        }
+    }
     if (!force) {
         size_t pos = out.size();
         out.resize(pos + size_t(tiles + 7) / 8);
         detail::pack_bitmap(dirty_.data(), tiles, out.data() + pos);
     }
 
-    // Tiles touch disjoint pixels, so they encode independently; each worker takes a
-    // contiguous run of dirty tiles and the runs are joined in raster order, which
-    // keeps the output identical for any thread count.
+    // Entropy code with the tables now in force.
     for (auto& w : worker_out_) w.clear();
-    parallel_for(int(dirty_list_.size()), std::max(1, 8192 / tile_area), [this](int b, int e, int worker) {
-        std::vector<uint8_t>& wout = worker_out_[size_t(worker)];
-        for (int i = b; i < e; ++i) {
-            int t = dirty_list_[size_t(i)];
-            encode_tile(t, wout);
-            copy_tile(cur_, last_coded_, t);
+    parallel_for(int(worker_tokens_.size()), 1, [this](int w0, int w1, int) {
+        for (int w = w0; w < w1; ++w) {
+            std::vector<uint8_t>& wout = worker_out_[size_t(w)];
+            const std::vector<detail::Token>& toks = worker_tokens_[size_t(w)];
+            for (const TileCode& tc : codes_) {
+                if (tc.worker != w || tc.dropped) continue;
+                size_t len_pos = wout.size();
+                wout.push_back(0);
+                wout.push_back(0);
+                detail::BitWriter bw(wout);
+                detail::emit_tokens(toks.data() + tc.tok_begin, tc.tok_end - tc.tok_begin, huff_, bw);
+                bw.flush();
+                put_u16(wout.data() + len_pos, uint32_t(wout.size() - len_pos - 2));
+            }
         }
     });
     for (auto& w : worker_out_) out.insert(out.end(), w.begin(), w.end());
-    uint32_t dirty_count = uint32_t(dirty_list_.size());
+
+    // Bookkeeping for the next frame: what the decoder now shows and predicts from.
+    for (int t : dirty_list_) {
+        if (!dirty_[size_t(t)]) continue;
+        copy_tile(cur_, last_coded_, t);
+        if (cfg_.motion) copy_tile(recon_, ref_, t);
+        prev_mvx_[size_t(t)] = info_[size_t(t)].mvx;
+        prev_mvy_[size_t(t)] = info_[size_t(t)].mvy;
+    }
+    sync_.add_frame(frame_index_, info_.data());
 
     // Audio for this frame: the samples up to floor((n+1) * rate * den / num).
     size_t audio_samples = 0, audio_padded = 0, audio_bytes = 0;
@@ -1895,6 +2905,9 @@ void Encoder::encode_frame(const uint8_t* y, int ystride, const uint8_t* u, int 
         stats->force_refresh = force;
         stats->dirty_tiles = dirty_count;
         stats->total_tiles = uint32_t(tiles);
+        stats->inter_tiles = inter;
+        stats->dropped_tiles = dropped;
+        stats->tables = tables;
         stats->bytes = out.size() - start;
         stats->audio_samples = uint32_t(audio_samples);
         stats->audio_bytes = audio_bytes;
