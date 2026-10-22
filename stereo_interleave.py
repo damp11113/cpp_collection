@@ -33,10 +33,20 @@ Transforms:
 Bin width is sample_rate / frame Hz for fft, so --frame 44100 at 44.1 kHz
 gives exact 1 Hz bins (with heavy time smearing).
 
+Mono WAV mode (pack / unpack) inverse-transforms the packed spectrum into an
+ordinary playable mono WAV. Because the MDCT is critically sampled and
+orthogonal, analysing that mono WAV again gives back the same packed bins, so
+stereo -> mono WAV -> stereo works. The L/R side info is stored in an extra
+"ilvs" RIFF chunk that normal players ignore; if it is lost (re-saved by an
+editor) unpack falls back to blind rebuild. Mono WAV mode is MDCT only: the
+STFT is 2x redundant and does not survive the round trip.
+
 Usage:
     python3 stereo_interleave.py encode in.wav out.npz [--transform fft] [--frame 2048] [--max-freq 16000] [--band-width 4]
     python3 stereo_interleave.py decode in.npz out.wav [--rebuild cross] [--width 8]
     python3 stereo_interleave.py test [in.wav] [encode/decode options]
+    python3 stereo_interleave.py pack in.wav mono.wav [--frame 2048] [--max-freq 16000] [--band-width 4]
+    python3 stereo_interleave.py unpack mono.wav out.wav [--rebuild cross] [--width 8]
 
 Requires numpy. Input must be a PCM stereo WAV (8/16/24/32-bit integer).
 """
@@ -44,6 +54,7 @@ Requires numpy. Input must be a PCM stereo WAV (8/16/24/32-bit integer).
 import argparse
 import io
 import os
+import struct
 import sys
 import wave
 
@@ -74,13 +85,35 @@ def read_wav(path):
     return x.reshape(-1, nch), sr
 
 
-def write_wav(path, x, sr):
+def write_wav(path, x, sr, chunks=None):
+    # chunks: optional {4-byte id: payload} written after the data chunk
     pcm = np.clip(np.round(x * 32767), -32768, 32767).astype("<i2")
-    with wave.open(path, "wb") as w:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
         w.setnchannels(x.shape[1])
         w.setsampwidth(2)
         w.setframerate(sr)
         w.writeframes(pcm.tobytes())
+    data = bytearray(buf.getvalue())
+    for cid, payload in (chunks or {}).items():
+        data += cid + struct.pack("<I", len(payload)) + payload
+        if len(payload) % 2:
+            data += b"\0"
+    data[4:8] = struct.pack("<I", len(data) - 8)
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def read_wav_chunk(path, chunk_id):
+    with open(path, "rb") as f:
+        data = f.read()
+    pos = 12
+    while pos + 8 <= len(data):
+        cid, size = data[pos:pos + 4], struct.unpack("<I", data[pos + 4:pos + 8])[0]
+        if cid == chunk_id:
+            return data[pos + 8:pos + 8 + size]
+        pos += 8 + size + (size % 2)
+    return None
 
 
 # ---------------------------------------------------------------- transforms
@@ -99,12 +132,13 @@ def frame_signal(x, n):
     return padded[idx]
 
 
-def overlap_add(frames, n, length):
+def overlap_add(frames, n, length=None):
+    # length=None keeps the padding at both ends (needed to re-analyse the output)
     hop = n // 2
     out = np.zeros((len(frames) + 1) * hop)
     for i, f in enumerate(frames):
         out[i * hop:i * hop + n] += f
-    return out[hop:hop + length]
+    return out if length is None else out[hop:hop + length]
 
 
 def mdct_basis(n):
@@ -153,7 +187,7 @@ def band_energy(spec, band_width):
     return e.reshape(n_frames, n_bands, band_width).sum(axis=2)
 
 
-def encode(x, sr, transform="fft", frame=2048, max_freq=None, band_width=4):
+def encode(x, sr, transform="fft", frame=2048, max_freq=None, band_width=4, dtype=np.float16):
     if x.shape[1] != 2:
         raise ValueError(f"need a stereo file, got {x.shape[1]} channel(s)")
     if frame % 2:
@@ -179,7 +213,7 @@ def encode(x, sr, transform="fft", frame=2048, max_freq=None, band_width=4):
         packed = np.stack([packed.real, packed.imag], axis=-1)
 
     return {
-        "coeffs": packed.astype(np.float16),
+        "coeffs": packed.astype(dtype),
         "lr_gain": lr_gain,
         "band_width": band_width,
         "sr": sr,
@@ -270,6 +304,61 @@ def load_encoded(path):
         return {k: z[k] for k in z.files}
 
 
+# ---------------------------------------------------------------- mono WAV mode
+
+def pack_mono(x, sr, frame=2048, max_freq=None, band_width=4):
+    """Stereo signal -> (mono signal in [-1, 1], side info dict)."""
+    enc = encode(x, sr, "mdct", frame, max_freq, band_width, dtype=np.float64)
+    coeffs = np.pad(enc["coeffs"], ((0, 0), (0, frame // 2 - enc["coeffs"].shape[1])))
+    frames = (coeffs @ mdct_basis(frame)) * (4 / frame) * sine_window(frame)
+    mono = overlap_add(frames, frame)
+    scale = max(np.max(np.abs(mono)) / 0.99, 1.0)
+    side = {
+        "lr_gain": enc["lr_gain"],
+        "band_width": band_width,
+        "length": len(x),
+        "frame": frame,
+        "n_bins": enc["coeffs"].shape[1],
+        "scale": scale,
+    }
+    return mono / scale, side
+
+
+def unpack_mono(mono, sr, side=None, rebuild="cross", width=8, frame=2048):
+    """Mono signal from pack_mono -> stereo signal. Without side info only avg/blind work."""
+    if side is None:
+        if rebuild == "cross":
+            rebuild = "blind"
+        side = {"frame": frame, "scale": 1.0, "n_bins": frame // 2,
+                "length": len(mono) - frame, "band_width": 1}
+    frame = int(side["frame"])
+    hop = frame // 2
+    n_frames = len(mono) // hop - 1
+    idx = np.arange(frame)[None, :] + hop * np.arange(n_frames)[:, None]
+    coeffs = (mono[idx] * float(side["scale"]) * sine_window(frame)) @ mdct_basis(frame).T
+    enc = {
+        "coeffs": coeffs[:, :int(side["n_bins"])],
+        "lr_gain": side.get("lr_gain"),
+        "band_width": side["band_width"],
+        "sr": sr,
+        "length": side["length"],
+        "frame": frame,
+        "transform": "mdct",
+    }
+    return decode(enc, rebuild, width)[0]
+
+
+def side_to_bytes(side):
+    buf = io.BytesIO()
+    np.savez_compressed(buf, **side)
+    return buf.getvalue()
+
+
+def side_from_bytes(data):
+    with np.load(io.BytesIO(data)) as z:
+        return {k: z[k] for k in z.files}
+
+
 # ---------------------------------------------------------------- test
 
 def test_signal(sr=44100, seconds=5.0, seed=0):
@@ -326,6 +415,11 @@ def run_test(args):
             ("rebuild avg", decode(enc, "avg")[0]),
             (f"rebuild blind (width {args.width})", decode(enc, "blind", args.width)[0]),
             (f"rebuild cross (band {args.band_width})", decode(enc, "cross")[0])]
+    if args.transform == "mdct":
+        mono, side = pack_mono(x, sr, args.frame, args.max_freq, args.band_width)
+        mono = np.round(mono * 32767) / 32767   # what a 16-bit mono WAV keeps
+        rows.append(("mono WAV round trip (pack)", unpack_mono(mono, sr, side)))
+
     print(f"{'method':30s} {'L SNR':>9s} {'R SNR':>9s}")
     for name, y in rows:
         print(f"{name:30s} {snr_db(x[:, 0], y[:, 0]):7.2f}dB {snr_db(x[:, 1], y[:, 1]):7.2f}dB")
@@ -371,6 +465,19 @@ def main():
     p.add_argument("output")
     dec_opts(p)
 
+    p = sub.add_parser("pack", help="stereo WAV -> playable mono WAV (MDCT, side info in WAV chunk)")
+    p.add_argument("input")
+    p.add_argument("output")
+    p.add_argument("--frame", type=int, default=2048, help="frame size in samples (even)")
+    p.add_argument("--max-freq", type=float, default=None, help="drop bins above this frequency (Hz)")
+    p.add_argument("--band-width", type=int, default=4, help="bins per stored L/R gain band")
+
+    p = sub.add_parser("unpack", help="mono WAV from pack -> stereo WAV")
+    p.add_argument("input")
+    p.add_argument("output")
+    dec_opts(p)
+    p.add_argument("--frame", type=int, default=2048, help="frame size, only used if the side chunk is missing")
+
     p = sub.add_parser("test", help="round-trip a WAV (or a synthetic signal) and print SNR")
     p.add_argument("input", nargs="?")
     enc_opts(p)
@@ -386,6 +493,26 @@ def main():
               f"{os.path.getsize(args.output):,} B")
     elif args.cmd == "decode":
         y, sr = decode(load_encoded(args.input), args.rebuild, args.width)
+        peak = np.max(np.abs(y))
+        if peak > 1:
+            print(f"warning: output peaks at {peak:.2f}, clipping", file=sys.stderr)
+        write_wav(args.output, y, sr)
+        print(f"{args.input} -> {args.output}")
+    elif args.cmd == "pack":
+        x, sr = read_wav(args.input)
+        mono, side = pack_mono(x, sr, args.frame, args.max_freq, args.band_width)
+        write_wav(args.output, mono[:, None], sr, {b"ilvs": side_to_bytes(side)})
+        print(f"{args.input} -> {args.output}: {os.path.getsize(args.input):,} B -> "
+              f"{os.path.getsize(args.output):,} B")
+    elif args.cmd == "unpack":
+        mono, sr = read_wav(args.input)
+        if mono.shape[1] != 1:
+            raise SystemExit(f"need a mono file from pack, got {mono.shape[1]} channels")
+        chunk = read_wav_chunk(args.input, b"ilvs")
+        if chunk is None:
+            print("warning: no ilvs side chunk, using blind rebuild", file=sys.stderr)
+        side = side_from_bytes(chunk) if chunk is not None else None
+        y = unpack_mono(mono[:, 0], sr, side, args.rebuild, args.width, args.frame)
         peak = np.max(np.abs(y))
         if peak > 1:
             print(f"warning: output peaks at {peak:.2f}, clipping", file=sys.stderr)
