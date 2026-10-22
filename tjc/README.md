@@ -148,13 +148,14 @@ zoom, screen content, motion graphics and noisy pan. All codecs run single-threa
 The older codecs get their better ffmpeg options: RD macroblock decisions,
 trellis, 4 vectors per macroblock, no B-frames and a keyframe every 4 s. H.264 runs
 `-tune psnr`. H.261 and baseline H.263 only take CIF-family sizes, so they are
-measured on a CIF version of the same clips. The scripts are in `bench/`, so you
-can run your own clip:
+measured on a CIF version of the same clips.
+
+`bench/compare_codecs.py` reruns all of this on your own video. It needs Python 3
+with numpy, ffmpeg, and the `tjc` tool, and works on Windows, Linux and macOS:
 
 ```bash
-ffmpeg -i test.mp4 -t 4 -f rawvideo -pix_fmt yuv420p clip.yuv
-TJC=./tjc bench/compare_codecs.sh clip.yuv 1280 720 120 30 > results.txt
-python3 bench/bd_rate.py results.txt --ref h263p
+python bench/compare_codecs.py prepare test.mp4 --seconds 4     # clip.yuv + clip.avi
+python bench/compare_codecs.py run --tjc ./tjc                   # results.txt + BD-rate tables
 ```
 
 BD-rate (PSNR-Y), the average bitrate difference at equal quality. Negative means
@@ -208,13 +209,47 @@ What this means:
   - Built-in synchronized audio.
   - A 24 KB decoder.
 
+### Bink Video
+
+Bink can't be measured here: RAD's encoder is closed and Windows-only, and ffmpeg
+only decodes it. The bench can measure Bink files you make yourself, on the same
+frames as everything else:
+
+1. `python bench/compare_codecs.py prepare test.mp4 --seconds 4` writes `clip.yuv`,
+   the reference, and `clip.avi`, the same frames as uncompressed RGB.
+2. In RAD Video Tools (free from RAD Game Tools), compress `clip.avi` to Bink
+   several times at different data rates. Name the files after the setting, for
+   example `bink_1000.bik`, `bink_2000.bik` and so on, from very low to very high.
+3. `python bench/compare_codecs.py run --tjc tjc.exe --extra bink=bink_*.bik`
+
+Bink converts RGB to YUV itself. The bench tries BT.601 and BT.709, TV and full
+range, finds the one that matches, and builds the reference the same way, so the
+conversion costs Bink nothing. ffmpeg decodes Bink 1 only, not Bink 2.
+
+How the designs differ. The Bink 1 entries come from ffmpeg's open decoder; Bink 2
+is closed:
+
+| | TJC4 | Bink 1 (1999) | Bink 2 (2013) |
+|---|---|---|---|
+| Coding unit | quadtree leaves 64x64 down to 8x8 | 8x8 blocks, each one of ~10 types: skip, fill, pattern, run, motion copy, residue, intra/inter DCT, raw, scaled 16x16 | proprietary |
+| Motion | half-pel vector per leaf | full-pel vector per 8x8 block | proprietary |
+| Entropy coding | JPEG Huffman, tables adapted per stream | values grouped per plane in "bundles", each with small Huffman trees | proprietary |
+| Rate control | per-frame quality, average target and hard cap | data-rate target | data-rate target |
+| Audio | QOA, integer-only | Bink Audio, a transform codec (ffmpeg decodes it with floating point) | Bink Audio |
+| Seeking | exact from any frame, no keyframes needed | keyframes | keyframes |
+| Decoder | 24 KB portable C++, integer-only | RAD SDK (closed); ffmpeg has an open decoder | RAD SDK (closed), built for fast SIMD and multi-core decoding |
+| License | this repository | encoding tools free; shipping a player needs a license from RAD (now part of Epic Games) | same |
+
+Bink 1 is TJC's closest relative: both pick a coding method per block and skip
+whatever didn't change. The bench shows which picks better.
+
 | File          | What                                                              |
 |---------------|-------------------------------------------------------------------|
 | `tjc.h`       | single-header library: encoder + decoder (stb-style)              |
 | `tjc.cpp`     | `tjc` command line tool: `encode`, `decode`, `info`               |
 | `tjc_test.cpp`| unit tests (DCT, Huffman, motion, seeking, QOA, fuzzing, ...) + end-to-end |
 | `gui/`        | **TJC Studio**: desktop player + encoder for Windows and Linux/X11 |
-| `bench/`      | rate-distortion comparison against MJPEG/H.261/H.263/MPEG-1/2/4/H.264 |
+| `bench/`      | rate-distortion comparison against MJPEG/H.261/H.263/MPEG-1/2/4/H.264, plus your own Bink files |
 
 ## Build
 

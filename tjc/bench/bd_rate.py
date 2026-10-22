@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Bjontegaard delta rate from bench/compare_codecs.sh results.
+"""Bjontegaard delta rate from bench/compare_codecs.py results.
 
-    python3 bench/bd_rate.py results.txt [more results ...] [--ref mjpeg] [--psnr 38]
+    python bench/bd_rate.py results.txt [more results ...] [--ref mjpeg] [--psnr 38]
 
 For each codec: the average bitrate difference against the reference codec at the
 same PSNR-Y (negative = fewer bits), the bitrate needed for --psnr dB, and the
@@ -14,13 +14,7 @@ import math
 
 import numpy as np
 
-ap = argparse.ArgumentParser()
-ap.add_argument('files', nargs='+')
-ap.add_argument('--ref', default='mjpeg')
-ap.add_argument('--psnr', type=float, default=38.0)
-args = ap.parse_args()
-
-order = ['mjpeg', 'h261', 'h263', 'h263p', 'mpeg1', 'mpeg2', 'mpeg4', 'x264', 'tjc2', 'tjc3', 'tjc4']
+ORDER = ['mjpeg', 'h261', 'h263', 'h263p', 'mpeg1', 'mpeg2', 'mpeg4', 'x264', 'tjc2', 'tjc3', 'tjc4']
 
 
 def load(path):
@@ -34,6 +28,7 @@ def load(path):
 
 
 def hull(pts):
+    """Points sorted by rate, keeping only those that improve quality."""
     out = []
     for p in sorted(pts):
         if not out or p[1] > out[-1][1]:
@@ -65,15 +60,26 @@ def rate_at(pts, target):
     return None
 
 
-clips = [load(f) for f in args.files]
-codecs = [c for c in order if any(c in d for d in clips)]
-print(f"BD-rate vs {args.ref} (PSNR-Y; negative = fewer bits for the same quality)")
-print(f"{'codec':8} {'BD-rate':>9}  " + ''.join(f"{'kbit/s@%gdB' % args.psnr:>14}{'enc s':>7}" for _ in clips))
-for c in codecs:
-    vals = [bd(d[args.ref], d[c]) for d in clips if args.ref in d and c in d]
-    vals = [v for v in vals if v is not None]
-    row = f"{c:8} " + (f"{sum(vals) / len(vals):>8.1f}% " if vals else f"{'n/a':>9} ")
-    for d in clips:
-        r = rate_at(d.get(c, []), args.psnr)
-        row += f"{r[0]:>14.0f}{r[1]:>7.2f}" if r else f"{'n/a':>14}{'':>7}"
-    print(row)
+def report(files, ref='mjpeg', target=38.0):
+    clips = [load(f) for f in files]
+    names = set().union(*clips)
+    codecs = [c for c in ORDER if c in names] + sorted(names - set(ORDER))
+    print(f"BD-rate vs {ref} (PSNR-Y; negative = fewer bits for the same quality)")
+    print(f"{'codec':8} {'BD-rate':>9}  " + ''.join(f"{'kbit/s@%gdB' % target:>14}{'enc s':>7}" for _ in clips))
+    for c in codecs:
+        vals = [bd(d[ref], d[c]) for d in clips if ref in d and c in d]
+        vals = [v for v in vals if v is not None]
+        row = f"{c:8} " + (f"{sum(vals) / len(vals):>8.1f}% " if vals else f"{'n/a':>9} ")
+        for d in clips:
+            r = rate_at(d.get(c, []), target)
+            row += f"{r[0]:>14.0f}{r[1]:>7.2f}" if r else f"{'n/a':>14}{'':>7}"
+        print(row)
+
+
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser()
+    ap.add_argument('files', nargs='+')
+    ap.add_argument('--ref', default='mjpeg')
+    ap.add_argument('--psnr', type=float, default=38.0)
+    args = ap.parse_args()
+    report(args.files, args.ref, args.psnr)
