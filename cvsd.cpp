@@ -5,9 +5,10 @@
 //   step min 10, step max 1280, run length J = 4,
 //   accumulator decay h = 1 - 1/32, step decay beta = 1 - 1/1024.
 //
-// The core runs at the bit rate. PCM input is upsampled (linear interpolation)
-// from the WAV rate to the bit rate before encoding, and the decoder's output is
-// low-pass filtered and decimated back to the WAV rate.
+// The core runs at the bit rate. PCM input is resampled from the WAV rate to the
+// bit rate (any ratio) before encoding, and the decoder's output is low-pass
+// filtered and resampled back to the WAV rate. Audio bandwidth is limited to
+// bitrate / 16 (4 kHz at 64 kbps).
 //
 // Build: g++ -O2 -std=c++17 cvsd.cpp -o cvsd
 
@@ -149,37 +150,54 @@ private:
     double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
 };
 
-std::vector<int16_t> upsample(const std::vector<int16_t>& in, int factor) {
-    std::vector<int16_t> out;
-    out.reserve(in.size() * factor);
-    for (size_t i = 0; i < in.size(); i++) {
-        double a = in[i];
-        double b = (i + 1 < in.size()) ? in[i + 1] : in[i];
-        for (int k = 0; k < factor; k++) {
-            out.push_back(static_cast<int16_t>(std::lround(a + (b - a) * k / factor)));
-        }
-    }
-    return out;
+// Audio bandwidth carried through the codec: limited by the PCM rate and by the
+// bit rate (64 kbps -> 4 kHz, matching Bluetooth CVSD).
+double codecBandwidth(double sampleRate, double bitRate) {
+    return std::min(0.45 * sampleRate, bitRate / 16.0);
 }
 
-std::vector<int16_t> downsample(const std::vector<int16_t>& in, int factor, double outRate) {
-    // Two cascaded biquads -> 4th-order Butterworth anti-alias filter.
+// 4th-order Butterworth low-pass (two cascaded biquads), with the filter's group
+// delay (2.6131 / wc) removed so the output stays aligned with the input.
+static void lowpass(std::vector<double>& v, double rate, double cutoff) {
+    if (v.empty()) return;
     const double pi = 3.14159265358979323846;
-    const double cutoff = outRate * 0.45;
-    double inRate = outRate * factor;
-    Biquad f1(inRate, cutoff), f2(inRate, cutoff);
+    size_t delay = static_cast<size_t>(std::lround(2.6131 / (2.0 * pi * cutoff) * rate));
 
-    // Compensate the filter's group delay (2.6131 / wc for a 4th-order Butterworth)
-    // so the output lines up with the original PCM.
-    size_t delay = static_cast<size_t>(std::lround(2.6131 / (2.0 * pi * cutoff) * inRate));
+    Biquad f1(rate, cutoff), f2(rate, cutoff);
+    std::vector<double> out;
+    out.reserve(v.size());
+    for (size_t i = 0; i < v.size() + delay; i++) {
+        double y = f2.process(f1.process(v[std::min(i, v.size() - 1)]));
+        if (i >= delay) out.push_back(y);
+    }
+    v.swap(out);
+}
 
-    std::vector<int16_t> out;
-    out.reserve(in.size() / factor + 1);
-    for (size_t i = 0; i < in.size() + delay; i++) {
-        double y = f2.process(f1.process(in[std::min(i, in.size() - 1)]));
-        if (i >= delay && (i - delay) % factor == 0) {
-            out.push_back(static_cast<int16_t>(std::clamp(std::lround(y), -32768L, 32767L)));
-        }
+// Arbitrary-ratio resampler: band-limits to `cutoff` at the higher of the two
+// rates and uses linear interpolation for the fractional positions.
+std::vector<int16_t> resample(const std::vector<int16_t>& in, double inRate, double outRate, double cutoff) {
+    if (in.empty()) return {};
+
+    std::vector<double> x(in.begin(), in.end());
+    bool decimating = outRate < inRate;
+    if (decimating) lowpass(x, inRate, cutoff);
+
+    size_t n = static_cast<size_t>(std::floor(in.size() * outRate / inRate));
+    std::vector<double> y(n);
+    for (size_t j = 0; j < n; j++) {
+        double pos = j * inRate / outRate;
+        size_t i = static_cast<size_t>(pos);
+        double frac = pos - i;
+        double a = x[std::min(i, x.size() - 1)];
+        double b = x[std::min(i + 1, x.size() - 1)];
+        y[j] = a + (b - a) * frac;
+    }
+
+    if (!decimating) lowpass(y, outRate, cutoff);
+
+    std::vector<int16_t> out(n);
+    for (size_t j = 0; j < n; j++) {
+        out[j] = static_cast<int16_t>(std::clamp<long>(std::lround(y[j]), -32768L, 32767L));
     }
     return out;
 }
@@ -329,29 +347,29 @@ CVSDStream readStream(const std::string& path) {
 // ---------------------------------------------------------------------------
 
 CVSDStream encodeAudio(const Audio& audio, uint32_t bitRate) {
-    if (audio.sampleRate <= 0 || bitRate == 0 || bitRate % audio.sampleRate != 0) {
-        throw std::runtime_error("bit rate must be an integer multiple of the sample rate");
+    if (audio.sampleRate <= 0 || bitRate == 0) {
+        throw std::runtime_error("sample rate and bit rate must be positive");
     }
-    int factor = static_cast<int>(bitRate / audio.sampleRate);
+    double cutoff = codecBandwidth(audio.sampleRate, bitRate);
 
     CVSDEncoder encoder;
     CVSDStream s;
     s.sampleRate = audio.sampleRate;
     s.bitRate = bitRate;
-    s.bits = encoder.encode(upsample(audio.samples, factor));
+    s.bits = encoder.encode(resample(audio.samples, audio.sampleRate, bitRate, cutoff));
     return s;
 }
 
 Audio decodeStream(const CVSDStream& s) {
-    if (s.sampleRate == 0 || s.bitRate == 0 || s.bitRate % s.sampleRate != 0) {
+    if (s.sampleRate == 0 || s.bitRate == 0) {
         throw std::runtime_error("invalid rates in CVSD stream header");
     }
-    int factor = static_cast<int>(s.bitRate / s.sampleRate);
+    double cutoff = codecBandwidth(s.sampleRate, s.bitRate);
 
     CVSDDecoder decoder;
     Audio audio;
     audio.sampleRate = static_cast<int>(s.sampleRate);
-    audio.samples = downsample(decoder.decode(s.bits), factor, s.sampleRate);
+    audio.samples = resample(decoder.decode(s.bits), s.bitRate, s.sampleRate, cutoff);
     return audio;
 }
 
@@ -373,7 +391,7 @@ static void usage(const char* prog) {
               << "  " << prog << " encode input.wav output.cvsd [bitrate]\n"
               << "  " << prog << " decode input.cvsd output.wav\n"
               << "  " << prog << " roundtrip input.wav output.wav [bitrate]\n"
-              << "bitrate defaults to 64000 and must be a multiple of the WAV sample rate.\n";
+              << "bitrate defaults to 64000 (any value; audio bandwidth = bitrate / 16).\n";
 }
 
 int main(int argc, char* argv[]) {
