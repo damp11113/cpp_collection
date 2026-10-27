@@ -1,3 +1,5 @@
+// This is not spyware! It just a keyboard frequency analyzer. Use for design your own keyboard layout.
+
 #include <windows.h>
 #include <iostream>
 #include <fstream>
